@@ -1,0 +1,179 @@
+//! One SQLite writer lock covers selection and durable reservation of inputs.
+
+use crate::{chain::Block, note::Receipt};
+use anyhow::{Context, Result, ensure};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    pub version: u32,
+    pub rpc_url: String,
+    pub cookie_file: Option<PathBuf>,
+    pub activation: u32,
+    pub activation_hash: String,
+    pub genesis: String,
+    pub network_id: String,
+    pub seed: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Pending {
+    pub txid: String,
+    pub raw: String,
+    pub expiry: u32,
+    pub source: String,
+    pub receipt: Option<Receipt>,
+}
+
+pub struct Store {
+    conn: Connection,
+}
+
+/// Never overwrite receipt files, and create private data with restrictive permissions.
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .context("cannot create private file (it may already exist)")?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+impl Store {
+    pub fn open(dir: &Path, initialize: bool) -> Result<Self> {
+        if initialize && !dir.exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(dir)?;
+            }
+            #[cfg(not(unix))]
+            fs::create_dir_all(dir)?;
+        }
+        let metadata = fs::symlink_metadata(dir).context("wallet does not exist; run init")?;
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "wallet must be a real directory"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            ensure!(
+                metadata.permissions().mode() & 0o077 == 0,
+                "wallet directory must be private (chmod 700)"
+            );
+        }
+        let path = dir.join("tachyon.sqlite");
+        if initialize {
+            write_private(&path, &[])?;
+        }
+        ensure!(
+            fs::symlink_metadata(&path)?.is_file(),
+            "wallet database must be a regular file"
+        );
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        conn.busy_timeout(Duration::from_secs(1))?;
+        conn.execute_batch("PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")?;
+        if initialize {
+            conn.execute_batch(
+                "CREATE TABLE config (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
+                CREATE TABLE blocks (height INTEGER PRIMARY KEY, data TEXT NOT NULL);
+                CREATE TABLE notes (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+                CREATE TABLE pending (txid TEXT PRIMARY KEY, data TEXT NOT NULL);",
+            )?;
+        }
+        Ok(Self { conn })
+    }
+    pub fn commit(&self) -> Result<()> {
+        Ok(self.conn.execute_batch("COMMIT")?)
+    }
+    pub fn set_config(&self, config: &Config) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO config VALUES(1, ?)",
+            [serde_json::to_string(config)?],
+        )?;
+        Ok(())
+    }
+    pub fn config(&self) -> Result<Config> {
+        let json: String = self
+            .conn
+            .query_row("SELECT data FROM config WHERE id=1", [], |r| r.get(0))?;
+        let config: Config = serde_json::from_str(&json)?;
+        ensure!(config.version == 1, "unsupported wallet database version");
+        Ok(config)
+    }
+    pub fn blocks(&self) -> Result<Vec<Block>> {
+        self.read_all("SELECT data FROM blocks ORDER BY height")
+    }
+    pub fn notes(&self) -> Result<Vec<Receipt>> {
+        self.read_all("SELECT data FROM notes ORDER BY id")
+    }
+    pub fn pending(&self) -> Result<Vec<Pending>> {
+        self.read_all("SELECT data FROM pending ORDER BY txid")
+    }
+    fn read_all<T: serde::de::DeserializeOwned>(&self, sql: &str) -> Result<Vec<T>> {
+        self.conn
+            .prepare(sql)?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .collect()
+    }
+    pub fn put_block(&self, block: &Block) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO blocks VALUES(?, ?)",
+            params![block.height, serde_json::to_string(block)?],
+        )?;
+        Ok(())
+    }
+    pub fn rewind(&self, height: u32) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM blocks WHERE height > ?", [height])?;
+        Ok(())
+    }
+    pub fn put_note(&self, receipt: &Receipt) -> Result<()> {
+        let existing: Option<String> = self
+            .conn
+            .query_row("SELECT data FROM notes WHERE id=?", [receipt.id()?], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let encoded = serde_json::to_string(receipt)?;
+        if let Some(existing) = existing {
+            ensure!(
+                existing == encoded,
+                "conflicting receipt for this commitment"
+            );
+        } else {
+            self.conn.execute(
+                "INSERT INTO notes VALUES(?, ?)",
+                params![receipt.id()?, encoded],
+            )?;
+        }
+        Ok(())
+    }
+    pub fn reserve(&self, pending: &Pending) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pending VALUES(?, ?)",
+            params![pending.txid, serde_json::to_string(pending)?],
+        )?;
+        Ok(())
+    }
+}
