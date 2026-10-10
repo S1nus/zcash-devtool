@@ -29,7 +29,8 @@ serialization, txid and sighash implementation, including a zero ZIP-233
 amount. The ordinary wallet dependencies remain separate and unchanged.
 
 Connect to a trusted, Tachyon-enabled archive Zakura node with
-`gettachyonblock` (the proof-sync RPC) and `sendrawtransaction`. NuTachyon must
+`gettachyonblock` (the proof-sync RPC), `getaddressutxos` with `chainInfo: true`,
+and `sendrawtransaction`. NuTachyon must
 already be active. The node and wallet must use the same epoch length: the
 default build uses 4096 blocks, not Tachyon's short `test-epoch-size` setting.
 The supplied activation height is checked against the feed. Genesis and the
@@ -68,18 +69,62 @@ $DEVTOOL tachyon --wallet-dir ./alice balance
 `sync` ingests at most 1000 blocks per invocation (adjustable with
 `--max-blocks`, maximum 10000). Repeat until `caught_up` is true. Balances are
 offline snapshots of the last successful sync, with note states `unconfirmed`,
-`available`, `reserved`, and `spent`. `available_zat` is before fees and is not a
-promise that multiple notes can be combined.
+`available`, `reserved`, and `spent`. Top-level `available_zat` remains the
+**Tachyon-only** balance, before fees, and is not a promise that multiple notes
+can be combined.
 
-Fund Alice's reported transparent `funding_address`, then shield one confirmed
-output. This consumes the entire UTXO less a fixed 50,000-zatoshi fee:
+`balance` also reports a separate `transparent` object for this wallet's
+`funding_address` (not addresses belonging to the ordinary `wallet` commands):
+
+- `total_zat`: all confirmed unspent funds at the transparent snapshot.
+- `available_zat`: confirmed, mature funds not reserved by this wallet.
+- `immature_zat`: unreserved coinbase funds with fewer than 100 confirmations.
+- `reserved_zat`: confirmed UTXOs reserved for a pending shielding transaction,
+  including one whose broadcast failed ambiguously.
+- `utxo_count`, `address`, `synced_height`, and `synced_hash`: snapshot metadata.
+
+The three balance categories are mutually exclusive and sum to `total_zat`.
+Available funds are before fees; each UTXO must individually cover the shielding
+fee. Unconfirmed incoming funds are excluded. The snapshot does not account for
+other software's mempool spends; `shield` rechecks the selected output with the
+node before spending it.
+
+Transparent funds are refreshed only when `sync` catches up to the UTXO index's
+captured tip, so both pools describe the same chain. A partial sync retains the
+older transparent snapshot and its explicit height. Before the first caught-up
+sync, or after a reorg invalidates that snapshot during a partial sync,
+`transparent` is `null`, **not zero**. RPC errors leave the previous committed
+state intact. `balance` never contacts the node. Existing wallet databases are
+upgraded automatically on their next caught-up sync; no reset is needed.
+
+Fund Alice's reported transparent `funding_address`, then shield an exact amount
+in zatoshis. The fixed 50,000-zatoshi fee is charged **in addition** to the amount:
 
 ```sh
+# Automatically select one eligible UTXO, shielding exactly 1,000,000 zatoshis:
+$DEVTOOL tachyon --wallet-dir ./alice shield 1000000
+# Or choose the funding outpoint explicitly:
+$DEVTOOL tachyon --wallet-dir ./alice shield 1000000 --txid PREVIOUS_TXID --index 0
+# Omit the amount to shield that output's entire value minus the fee (as before):
 $DEVTOOL tachyon --wallet-dir ./alice shield --txid PREVIOUS_TXID --index 0
 # Wait until mined, then:
 $DEVTOOL tachyon --wallet-dir ./alice sync
 $DEVTOOL tachyon --wallet-dir ./alice balance
 ```
+
+Automatic selection picks the smallest eligible confirmed UTXO covering amount
+plus fee, excluding this wallet's reservations and outputs unavailable in the
+node's mempool view. It does not combine UTXOs. `--txid` and `--index` must be
+provided together; bare `shield` requires an amount or explicit outpoint.
+Any surplus returns to the wallet's funding address as **transparent change**,
+not an extra Tachyon note. Change must confirm before it can be selected again.
+
+**Coinbase exception:** Zakura normally forbids transparent outputs in a
+transaction spending a coinbase reward. The wallet therefore accepts a coinbase
+UTXO only if the amount equals its entire value minus the fee (or the amount is
+omitted with an explicit outpoint). It never silently shields extra funds.
+To shield mining rewards of an arbitrary size, use the explicit full-output
+command instead; custom-network relaxations of this rule are not auto-detected.
 
 Pay Bob using his `tachyon_address`. The current `tachyon-test:<payment-key>`
 format is a devtool-specific test encoding, not a standardized Zcash address.

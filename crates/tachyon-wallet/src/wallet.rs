@@ -2,6 +2,7 @@
 
 use crate::{
     chain::{Block, bytes32},
+    funding_balance::{AddressUtxos, COINBASE_MATURITY},
     note::{self, Receipt},
     rpc::Rpc,
     store::{Config, Pending, Store, write_private},
@@ -47,7 +48,7 @@ enum Operation {
     },
     /// Print Tachyon payment and transparent funding addresses.
     Address,
-    /// Show balances and note states from the last successful sync.
+    /// Show Tachyon notes and confirmed transparent funding from the last successful sync, offline.
     Balance,
     /// Validate and persist chain inputs; repeat until caught_up is true.
     Sync {
@@ -59,12 +60,17 @@ enum Operation {
         #[arg(long)]
         receipt: PathBuf,
     },
-    /// Shield an entire owned, confirmed P2PKH output, less the fee.
+    /// Shield an amount in zatoshis, or an entire explicit output less the fee.
     Shield {
-        #[arg(long)]
-        txid: String,
-        #[arg(long)]
-        index: u32,
+        /// Exact amount entering Tachyon, excluding the fee. Automatically selects one UTXO.
+        #[arg(value_name = "AMOUNT_ZAT", required_unless_present = "txid", value_parser = clap::value_parser!(u64).range(1..))]
+        amount_zat: Option<u64>,
+        /// Funding transaction ID; requires --index. Omit the amount to shield its full output.
+        #[arg(long, requires = "index")]
+        txid: Option<String>,
+        /// Zero-based output index within the funding transaction; requires --txid.
+        #[arg(long, requires = "txid")]
+        index: Option<u32>,
     },
     /// Spend one sufficiently large Tachyon note, returning change to this wallet.
     Send {
@@ -166,7 +172,26 @@ impl Command {
                     .try_fold(0u64, |total, (r, _)| {
                         total.checked_add(r.value_zat).context("balance overflow")
                     })?;
+                let snapshot = store.funding_snapshot()?;
+                let reserved = store
+                    .pending()?
+                    .into_iter()
+                    .filter(|p| pending_status(p, &blocks) != "expired")
+                    .map(|p| p.source)
+                    .collect();
+                let transparent = snapshot
+                    .as_ref()
+                    .map(|snapshot| {
+                        ensure!(
+                            blocks.iter().any(|block| block.height == snapshot.height
+                                && block.hash == snapshot.hash),
+                            "transparent snapshot is no longer on the synced chain; run sync"
+                        );
+                        snapshot.balance(&reserved)
+                    })
+                    .transpose()?;
                 json!({"synced_height":blocks.last().map(|b| b.height), "available_zat":available,
+                    "transparent":transparent,
                     "notes":states.into_iter().map(|(r,s)| Ok(json!({"id":r.id()?,"value_zat":r.value_zat,"status":s}))).collect::<Result<Vec<_>>>()?})
             }
             Operation::Sync { max_blocks } => sync(&store, &config, max_blocks)?,
@@ -242,7 +267,11 @@ fn sync(store: &Store, config: &Config, max_blocks: u32) -> Result<Value> {
         rpc.hash(0)? == config.genesis && rpc.hash(config.activation)? == config.activation_hash,
         "network identity changed (including possible regenesis); use a separate wallet directory"
     );
-    let tip = rpc.height()?;
+    let funding_address = transaction::funding_address(config.seed)?;
+    // The UTXO index and Tachyon feed must describe the same chain tip, even if
+    // mining continues while we download. Partial syncs retain their older snapshot.
+    let funding = AddressUtxos::fetch(&rpc, &funding_address)?;
+    let tip = funding.height;
     let mut blocks = store.blocks()?;
     while let Some(last) = blocks.last() {
         if last.height <= tip && rpc.hash(last.height)? == last.hash {
@@ -262,12 +291,17 @@ fn sync(store: &Store, config: &Config, max_blocks: u32) -> Result<Value> {
         blocks.push(block);
     }
     let last = blocks.last().context("activation block exists")?;
+    if last.height == tip {
+        let snapshot = funding.into_snapshot(&rpc, &funding_address, &blocks)?;
+        store.put_funding_snapshot(&snapshot)?;
+    }
     ensure!(
         rpc.hash(last.height)? == last.hash,
         "chain reorganized during sync; retry"
     );
     Ok(
-        json!({"height":last.height,"hash":last.hash,"epoch":last.epoch,"caught_up":last.height == tip}),
+        json!({"height":last.height,"hash":last.hash,"epoch":last.epoch,"caught_up":last.height == tip,
+            "transparent_synced_height":store.funding_snapshot()?.map(|snapshot| snapshot.height)}),
     )
 }
 
@@ -347,6 +381,32 @@ fn note_states(
 
 fn pay(store: &Store, config: &Config, operation: Operation) -> Result<Value> {
     match &operation {
+        Operation::Shield {
+            amount_zat,
+            txid,
+            index,
+        } => {
+            ensure!(
+                txid.is_some() == index.is_some(),
+                "--txid and --index must be provided together"
+            );
+            ensure!(
+                amount_zat.is_some() || txid.is_some(),
+                "provide an amount or both --txid and --index"
+            );
+            if let Some(amount) = amount_zat {
+                ensure!(*amount > 0, "amount must be positive");
+                protocol::value::Zatoshis::from_u64(
+                    amount
+                        .checked_add(FEE)
+                        .context("amount plus fee overflow")?,
+                )
+                .context("amount plus fee exceeds the monetary range")?;
+            }
+            if let Some(txid) = txid {
+                bytes32(txid)?;
+            }
+        }
         Operation::Send { to, .. } => {
             note::decode_address(to)?;
         }
@@ -380,13 +440,29 @@ fn pay(store: &Store, config: &Config, operation: Operation) -> Result<Value> {
     let mut outputs = Vec::new();
     let mut spend = None;
     let mut funding = None;
-    let mut unshield = None;
+    let mut transparent_output = None;
     let mut recipient = None;
     let source;
     let rpc = rpc(config)?;
     match operation {
-        Operation::Shield { txid, index } => {
-            bytes32(&txid)?;
+        Operation::Shield {
+            amount_zat,
+            txid,
+            index,
+        } => {
+            let (txid, index) = match (txid, index) {
+                (Some(txid), Some(index)) => (hex::encode(bytes32(&txid)?), index),
+                (None, None) => select_funding_outpoint(
+                    store,
+                    &blocks,
+                    &rpc,
+                    amount_zat
+                        .context("automatic selection requires an amount")?
+                        .checked_add(FEE)
+                        .context("amount plus fee overflow")?,
+                )?,
+                _ => anyhow::bail!("--txid and --index must be provided together"),
+            };
             source = format!("outpoint:{txid}:{index}");
             ensure!(
                 !store
@@ -407,7 +483,7 @@ fn pay(store: &Store, config: &Config, operation: Operation) -> Result<Value> {
                 .as_bool()
                 .context("missing coinbase flag")?;
             ensure!(
-                confirmations >= if coinbase { 100 } else { 1 },
+                confirmations >= if coinbase { COINBASE_MATURITY } else { 1 },
                 "funding output is not mature/confirmed"
             );
             let raw: String = rpc.call("getrawtransaction", json!([txid, 0]))?;
@@ -422,11 +498,23 @@ fn pay(store: &Store, config: &Config, operation: Operation) -> Result<Value> {
                 .and_then(|b| b.vout.get(usize::try_from(index).ok()?))
                 .context("funding output missing")?
                 .clone();
-            let amount = output
+            let after_fee = output
                 .value()
                 .into_u64()
                 .checked_sub(FEE)
                 .context("funding output cannot pay fee")?;
+            let amount = amount_zat.unwrap_or(after_fee);
+            ensure!(amount > 0, "funding output must exceed the fee");
+            let change = after_fee
+                .checked_sub(amount)
+                .context("funding output cannot cover amount plus fee")?;
+            ensure!(
+                !coinbase || change == 0,
+                "coinbase outputs must be shielded in full minus the fee; omit the amount with --txid/--index, or use a non-coinbase UTXO"
+            );
+            if change > 0 {
+                transparent_output = Some((transaction::funding_address(config.seed)?, change));
+            }
             outputs.push(Receipt::new(&config.network_id, &own_address, amount)?);
             funding = Some(Funding {
                 outpoint: transparent::bundle::OutPoint::new(*previous.txid().as_ref(), index),
@@ -446,7 +534,7 @@ fn pay(store: &Store, config: &Config, operation: Operation) -> Result<Value> {
                 recipient = Some(receipt);
             } else {
                 transaction::transparent_script(&to)?;
-                unshield = Some((to, amount_zat));
+                transparent_output = Some((to, amount_zat));
             }
             let change = selected.value_zat - needed;
             if change > 0 {
@@ -462,7 +550,7 @@ fn pay(store: &Store, config: &Config, operation: Operation) -> Result<Value> {
         spend: spend.as_ref(),
         funding,
         outputs: &outputs,
-        unshield,
+        transparent_output,
         expiry,
     })?;
     ensure!(
@@ -492,6 +580,53 @@ fn pay(store: &Store, config: &Config, operation: Operation) -> Result<Value> {
     })?;
     Ok(
         json!({"txid":txid,"status":"submitted","fee_zat":FEE,"expiry_height":expiry,"has_receipt":pending.receipt.is_some()}),
+    )
+}
+
+fn select_funding_outpoint(
+    store: &Store,
+    blocks: &[Block],
+    rpc: &Rpc,
+    needed: u64,
+) -> Result<(String, u32)> {
+    let snapshot = store
+        .funding_snapshot()?
+        .context("run sync until caught up before selecting funding")?;
+    let reserved = store
+        .pending()?
+        .into_iter()
+        .filter(|pending| pending_status(pending, blocks) != "expired")
+        .map(|pending| pending.source)
+        .collect();
+    // Avoid an RPC per mining reward when all of them would require forbidden transparent change.
+    let coinbases: BTreeSet<_> = blocks
+        .iter()
+        .filter_map(|block| block.transactions.first())
+        .map(String::as_str)
+        .collect();
+    for (txid, index, value) in snapshot.candidates(needed, &reserved) {
+        if value > needed && coinbases.contains(txid) {
+            continue;
+        }
+        let available: Value = rpc.call("gettxout", json!([txid, index, true]))?;
+        if available.is_null() {
+            continue; // Spent in the mempool, or since the captured UTXO snapshot.
+        }
+        let coinbase = available["coinbase"]
+            .as_bool()
+            .context("missing coinbase flag")?;
+        let confirmations = available["confirmations"]
+            .as_u64()
+            .context("missing confirmations")?;
+        if confirmations < if coinbase { COINBASE_MATURITY } else { 1 }
+            || (coinbase && value != needed)
+        {
+            continue;
+        }
+        return Ok((txid.into(), index));
+    }
+    anyhow::bail!(
+        "no single eligible UTXO covers amount plus fee; inputs are not combined, reserved/immature outputs are excluded, and coinbase outputs must be shielded in full minus the fee"
     )
 }
 

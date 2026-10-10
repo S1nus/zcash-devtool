@@ -87,7 +87,8 @@ pub struct Payment<'a> {
     pub spend: Option<&'a Receipt>,
     pub funding: Option<Funding>,
     pub outputs: &'a [Receipt],
-    pub unshield: Option<(String, u64)>,
+    /// An unshielded payment, or transparent change from shielding a non-coinbase UTXO.
+    pub transparent_output: Option<(String, u64)>,
     pub expiry: u32,
 }
 
@@ -98,7 +99,7 @@ pub fn build(payment: Payment<'_>) -> Result<Transaction> {
         spend,
         funding,
         outputs,
-        unshield,
+        transparent_output,
         expiry,
     } = payment;
     let tip = blocks.last().context("wallet has not synced")?;
@@ -110,11 +111,10 @@ pub fn build(payment: Payment<'_>) -> Result<Transaction> {
         .map(|r| r.value_zat)
         .or_else(|| funding.as_ref().map(|f| f.output.value().into_u64()))
         .unwrap_or(0);
-    let outgoing = outputs
-        .iter()
-        .try_fold(unshield.as_ref().map_or(0, |(_, n)| *n), |total, r| {
-            total.checked_add(r.value_zat).context("amount overflow")
-        })?;
+    let outgoing = outputs.iter().try_fold(
+        transparent_output.as_ref().map_or(0, |(_, n)| *n),
+        |total, r| total.checked_add(r.value_zat).context("amount overflow"),
+    )?;
     ensure!(
         incoming.checked_sub(outgoing) == Some(FEE),
         "transaction must pay the configured fee"
@@ -168,7 +168,7 @@ pub fn build(payment: Payment<'_>) -> Result<Transaction> {
             )]
         })
         .unwrap_or_default();
-    let vout = unshield
+    let vout = transparent_output
         .map(|(address, amount)| -> Result<_> {
             Ok(TxOut::new(
                 Zatoshis::from_u64(amount)?,

@@ -17,8 +17,14 @@ use zcash_tachyon::TachyonBundle;
 struct NodeData {
     blocks: Vec<Block>,
     raw_funding: String,
+    raw_transactions: BTreeMap<String, String>,
+    txout_overrides: BTreeMap<(String, u32), Value>,
     mempool: Vec<String>,
     fail_submission: bool,
+    funding_utxos: Vec<Value>,
+    fail_funding_sync: bool,
+    funding_hash_override: Option<String>,
+    earlier_blocks: BTreeMap<u32, Value>,
 }
 struct Node {
     url: String,
@@ -40,8 +46,14 @@ impl Node {
         let data = Arc::new(Mutex::new(NodeData {
             blocks: vec![crate::tests::genesis()],
             raw_funding: String::new(),
+            raw_transactions: BTreeMap::new(),
+            txout_overrides: BTreeMap::new(),
             mempool: vec![],
             fail_submission: false,
+            funding_utxos: vec![],
+            fail_funding_sync: false,
+            funding_hash_override: None,
+            earlier_blocks: BTreeMap::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_data = data.clone();
@@ -82,6 +94,15 @@ impl Node {
                 let result = match request["method"].as_str().unwrap() {
                     "getblockchaininfo" => json!({"chain":"test"}),
                     "getblockcount" => json!(data.blocks.last().unwrap().height),
+                    "getaddressutxos" => {
+                        assert_eq!(params[0]["chainInfo"], true);
+                        if data.fail_funding_sync {
+                            error = json!({"code": -1, "message": "simulated UTXO index error"});
+                        }
+                        let tip = data.blocks.last().unwrap();
+                        json!({"height": tip.height, "hash": data.funding_hash_override.as_ref().unwrap_or(&tip.hash),
+                            "utxos": data.funding_utxos.iter().filter(|output| output["address"] == params[0]["addresses"][0]).collect::<Vec<_>>()})
+                    }
                     "getblockhash" => {
                         let h = params[0].as_u64().unwrap();
                         if h == 0 {
@@ -102,15 +123,38 @@ impl Node {
                             .unwrap()
                     }
                     "getblock" => {
-                        let block = data
-                            .blocks
-                            .iter()
-                            .find(|b| b.hash == params[0].as_str().unwrap())
-                            .unwrap();
-                        json!({"hash":block.hash,"tx":block.transactions})
+                        let id = params[0].as_str().unwrap();
+                        if let Some(block) = id
+                            .parse::<u32>()
+                            .ok()
+                            .and_then(|height| data.earlier_blocks.get(&height))
+                        {
+                            block.clone()
+                        } else {
+                            let block = data
+                                .blocks
+                                .iter()
+                                .find(|b| b.hash == id || Some(b.height) == id.parse::<u32>().ok())
+                                .unwrap();
+                            json!({"hash":block.hash,"height":block.height,"tx":block.transactions})
+                        }
                     }
-                    "gettxout" => json!({"confirmations":100,"coinbase":true}),
-                    "getrawtransaction" => json!(data.raw_funding),
+                    "gettxout" => {
+                        assert_eq!(params[2], true);
+                        let key = (
+                            params[0].as_str().unwrap().to_owned(),
+                            u32::try_from(params[1].as_u64().unwrap()).unwrap(),
+                        );
+                        data.txout_overrides
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| json!({"confirmations":100,"coinbase":false}))
+                    }
+                    "getrawtransaction" => json!(
+                        data.raw_transactions
+                            .get(params[0].as_str().unwrap())
+                            .unwrap_or(&data.raw_funding)
+                    ),
                     "sendrawtransaction" => {
                         let raw = params[0].as_str().unwrap().to_owned();
                         let tx =
@@ -147,7 +191,22 @@ impl Node {
         let mut data = self.data.lock().unwrap();
         let raw = data.mempool.remove(0);
         let tx = Transaction::read(&hex::decode(raw)?[..], BranchId::NuTachyon)?;
-        crate::tests::mine(&mut data.blocks, Some(&tx))
+        if let Some(bundle) = tx.transparent_bundle() {
+            for input in &bundle.vin {
+                let txid =
+                    primitives::transaction::TxId::from_bytes(*input.prevout().hash()).to_string();
+                data.funding_utxos.retain(|output| {
+                    output["txid"] != txid || output["outputIndex"] != input.prevout().n()
+                });
+            }
+        }
+        crate::tests::mine(&mut data.blocks, Some(&tx))?;
+        let block = data.blocks.last_mut().unwrap();
+        block.transactions.insert(0, "55".repeat(32));
+        for stamp in &mut block.stamps {
+            stamp.transaction_index += 1;
+        }
+        Ok(())
     }
 }
 
@@ -161,6 +220,529 @@ fn command(dir: &std::path::Path, command: Operation) -> Result<Value> {
 fn synced_balance(dir: &std::path::Path) -> Result<Value> {
     command(dir, Operation::Sync { max_blocks: 1000 })?;
     command(dir, Operation::Balance)
+}
+
+fn funding_utxo(address: &str, txid: &str, index: u32, height: u32, amount: u64) -> Result<Value> {
+    Ok(
+        json!({"address": address, "txid": txid, "outputIndex": index, "height": height,
+        "satoshis": amount, "script": hex::encode(transaction::transparent_script(address)?.0.0)}),
+    )
+}
+
+fn init_wallet(node: &Node, dir: &std::path::Path) -> Result<String> {
+    let result = command(
+        dir,
+        Operation::Init {
+            rpc_url: node.url.clone(),
+            activation_height: 8,
+            cookie_file: None,
+            accept_mock_proofs: true,
+        },
+    )?;
+    Ok(result["funding_address"].as_str().unwrap().into())
+}
+
+fn install_funding(node: &Node, address: &str, amounts: &[u64]) -> Result<Transaction> {
+    let funding = TransactionData::<Authorized>::from_parts_v7(
+        BranchId::NuTachyon,
+        0,
+        BlockHeight::from_u32(0),
+        Zatoshis::ZERO,
+        Some(Bundle {
+            vin: vec![],
+            vout: amounts
+                .iter()
+                .map(|amount| {
+                    Ok(TxOut::new(
+                        Zatoshis::from_u64(*amount)?,
+                        transaction::transparent_script(address)?,
+                    ))
+                })
+                .collect::<Result<_>>()?,
+            authorization: transparent::bundle::Authorized,
+        }),
+        None,
+        None,
+        None,
+        TachyonBundle::NoBundle,
+    )
+    .freeze()?;
+    let mut raw = Vec::new();
+    funding.write(&mut raw)?;
+    let mut data = node.data.lock().unwrap();
+    data.raw_transactions
+        .insert(funding.txid().to_string(), hex::encode(raw));
+    data.blocks[0].transactions = vec!["44".repeat(32), funding.txid().to_string()];
+    for (index, amount) in amounts.iter().enumerate() {
+        data.funding_utxos.push(funding_utxo(
+            address,
+            &funding.txid().to_string(),
+            u32::try_from(index)?,
+            8,
+            *amount,
+        )?);
+    }
+    Ok(funding)
+}
+
+#[test]
+fn shield_cli_accepts_amount_or_paired_outpoint_only() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        wallet: Command,
+    }
+    let parse = |args: &[&str]| {
+        Cli::try_parse_from(
+            ["test", "--wallet-dir", "unused", "shield"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+    };
+    for args in [
+        vec!["100000"],
+        vec!["100000", "--txid", "aa", "--index", "0"],
+        vec!["--txid", "aa", "--index", "1"],
+    ] {
+        assert!(parse(&args).is_ok(), "{args:?}");
+    }
+    for args in [
+        vec![],
+        vec!["0"],
+        vec!["-1"],
+        vec!["1.5"],
+        vec!["18446744073709551616"],
+        vec!["--txid", "aa"],
+        vec!["--index", "0"],
+        vec!["100000", "--txid", "aa"],
+        vec!["100000", "--index", "0"],
+    ] {
+        assert!(parse(&args).is_err(), "{args:?}");
+    }
+}
+
+#[test]
+fn automatic_shield_selects_smallest_eligible_output_and_returns_transparent_change() -> Result<()>
+{
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    let funding = install_funding(
+        &node,
+        &address,
+        &[
+            400_000, 200_000, 150_000, 100_000, 225_000, 250_000, 275_000,
+        ],
+    )?;
+    let txid = funding.txid().to_string();
+    {
+        let store = Store::open(&dir, false)?;
+        store.reserve(&Pending {
+            txid: "66".repeat(32),
+            raw: "00".into(),
+            expiry: 20,
+            source: format!("outpoint:{txid}:1"),
+            receipt: None,
+        })?;
+        store.commit()?;
+        let mut data = node.data.lock().unwrap();
+        data.txout_overrides.insert((txid.clone(), 2), Value::Null);
+        data.txout_overrides.insert(
+            (txid.clone(), 4),
+            json!({"coinbase":true,"confirmations":99}),
+        );
+        data.txout_overrides.insert(
+            (txid.clone(), 5),
+            json!({"coinbase":true,"confirmations":100}),
+        );
+        data.fail_submission = true;
+    }
+    let error = command(
+        &dir,
+        Operation::Shield {
+            amount_zat: Some(100_000),
+            txid: None,
+            index: None,
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("broadcast outcome may be ambiguous"));
+    let tx = Transaction::read(
+        &hex::decode(&node.data.lock().unwrap().mempool[0])?[..],
+        BranchId::NuTachyon,
+    )?;
+    let transparent = tx.transparent_bundle().unwrap();
+    assert_eq!(transparent.vin.len(), 1);
+    assert_eq!(transparent.vin[0].prevout().n(), 6);
+    assert_eq!(transparent.vout.len(), 1);
+    assert_eq!(transparent.vout[0].value().into_u64(), 125_000);
+    assert_eq!(
+        transparent.vout[0].script_pubkey(),
+        &transaction::transparent_script(&address)?
+    );
+    transaction::verify_for_test(
+        &tx,
+        Some(funding.transparent_bundle().unwrap().vout[6].clone()),
+    )?;
+    assert_eq!(
+        command(&dir, Operation::Balance)?["transparent"]["reserved_zat"],
+        475_000
+    );
+    let error = command(
+        &dir,
+        Operation::Shield {
+            amount_zat: Some(100_000),
+            txid: Some(txid),
+            index: Some(6),
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("already reserved"));
+    node.data.lock().unwrap().fail_submission = false;
+    command(
+        &dir,
+        Operation::Submit {
+            txid: tx.txid().to_string(),
+        },
+    )?;
+    assert_eq!(node.data.lock().unwrap().mempool.len(), 1);
+    node.data.lock().unwrap().funding_utxos.push(funding_utxo(
+        &address,
+        &tx.txid().to_string(),
+        0,
+        9,
+        125_000,
+    )?);
+    node.mine()?;
+    let balance = synced_balance(&dir)?;
+    assert_eq!(balance["available_zat"], 100_000);
+    assert_eq!(balance["transparent"]["reserved_zat"], 200_000);
+    assert_eq!(balance["transparent"]["total_zat"], 1_450_000);
+    Ok(())
+}
+
+#[test]
+fn explicit_shield_amount_overrides_selection_and_legacy_sweeps_the_output() -> Result<()> {
+    for (amount, index, expected_note, expected_change) in [
+        (Some(100_000), 0, 100_000, Some(350_000)),
+        (Some(100_000), 1, 100_000, None),
+        (None, 0, 450_000, None),
+    ] {
+        let node = Node::start()?;
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("wallet");
+        let address = init_wallet(&node, &dir)?;
+        let funding = install_funding(&node, &address, &[500_000, 150_000])?;
+        command(
+            &dir,
+            Operation::Shield {
+                amount_zat: amount,
+                txid: Some(funding.txid().to_string().to_uppercase()),
+                index: Some(index),
+            },
+        )?;
+        let tx = Transaction::read(
+            &hex::decode(&node.data.lock().unwrap().mempool[0])?[..],
+            BranchId::NuTachyon,
+        )?;
+        let transparent = tx.transparent_bundle().unwrap();
+        assert_eq!(transparent.vin[0].prevout().n(), index);
+        assert_eq!(
+            transparent.vout.first().map(|out| out.value().into_u64()),
+            expected_change
+        );
+        transaction::verify_for_test(
+            &tx,
+            Some(funding.transparent_bundle().unwrap().vout[usize::try_from(index)?].clone()),
+        )?;
+        node.mine()?;
+        assert_eq!(synced_balance(&dir)?["available_zat"], expected_note);
+    }
+    Ok(())
+}
+
+#[test]
+fn shield_rejects_invalid_amounts_insufficient_single_outputs_and_partial_coinbase() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    let funding = install_funding(&node, &address, &[150_000, 150_000])?;
+    for amount in [0, u64::MAX, 2_100_000_000_000_000] {
+        assert!(
+            command(
+                &dir,
+                Operation::Shield {
+                    amount_zat: Some(amount),
+                    txid: None,
+                    index: None
+                }
+            )
+            .is_err()
+        );
+    }
+    let error = command(
+        &dir,
+        Operation::Shield {
+            amount_zat: Some(200_000),
+            txid: None,
+            index: None,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("no single eligible UTXO"));
+    let error = command(
+        &dir,
+        Operation::Shield {
+            amount_zat: Some(200_000),
+            txid: Some(funding.txid().to_string()),
+            index: Some(0),
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("cannot cover amount plus fee"));
+    {
+        let mut data = node.data.lock().unwrap();
+        for index in 0..2 {
+            data.txout_overrides.insert(
+                (funding.txid().to_string(), index),
+                json!({"coinbase":true,"confirmations":100}),
+            );
+        }
+    }
+    let error = command(
+        &dir,
+        Operation::Shield {
+            amount_zat: Some(50_000),
+            txid: Some(funding.txid().to_string()),
+            index: Some(0),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("coinbase outputs must be shielded in full")
+    );
+    let error = command(
+        &dir,
+        Operation::Shield {
+            amount_zat: Some(50_000),
+            txid: None,
+            index: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("coinbase outputs must be shielded in full")
+    );
+    assert!(node.data.lock().unwrap().mempool.is_empty());
+    assert!(Store::open(&dir, false)?.pending()?.is_empty());
+    // An exact amount may consume a mature coinbase output without transparent change.
+    command(
+        &dir,
+        Operation::Shield {
+            amount_zat: Some(100_000),
+            txid: None,
+            index: None,
+        },
+    )?;
+    let tx = Transaction::read(
+        &hex::decode(&node.data.lock().unwrap().mempool[0])?[..],
+        BranchId::NuTachyon,
+    )?;
+    assert!(tx.transparent_bundle().unwrap().vout.is_empty());
+    transaction::verify_for_test(
+        &tx,
+        Some(funding.transparent_bundle().unwrap().vout[0].clone()),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn existing_wallet_upgrades_on_sync_and_balance_stays_offline() -> Result<()> {
+    let node = Node::start()?;
+    node.data.lock().unwrap().blocks[0].transactions = vec!["44".repeat(32)];
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    // Initialization still creates the original v1 schema, with no funding table.
+    let conn = rusqlite::Connection::open(dir.join("tachyon.sqlite"))?;
+    let table_count: u32 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE name='funding_snapshot'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(table_count, 0);
+    assert!(command(&dir, Operation::Balance)?["transparent"].is_null());
+    node.data.lock().unwrap().funding_utxos =
+        vec![funding_utxo(&address, &"11".repeat(32), 0, 8, 700_000)?];
+    let balance = synced_balance(&dir)?;
+    assert_eq!(balance["available_zat"], 0);
+    assert_eq!(balance["transparent"]["available_zat"], 700_000);
+    assert_eq!(balance["transparent"]["address"], address);
+    drop(node);
+    assert_eq!(command(&dir, Operation::Balance)?, balance);
+    Ok(())
+}
+
+#[test]
+fn partial_sync_keeps_canonical_snapshots_and_reorgs_replace_them() -> Result<()> {
+    let node = Node::start()?;
+    node.data.lock().unwrap().blocks[0].transactions = vec!["44".repeat(32)];
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    {
+        let mut data = node.data.lock().unwrap();
+        data.funding_utxos = vec![funding_utxo(&address, &"11".repeat(32), 0, 8, 1000)?];
+        for _ in 0..2 {
+            crate::tests::mine(&mut data.blocks, None)?;
+        }
+    }
+    let partial = command(&dir, Operation::Sync { max_blocks: 1 })?;
+    assert_eq!(partial["height"], 9);
+    assert_eq!(partial["caught_up"], false);
+    assert!(partial["transparent_synced_height"].is_null());
+    assert!(command(&dir, Operation::Balance)?["transparent"].is_null());
+    assert_eq!(synced_balance(&dir)?["transparent"]["total_zat"], 1000);
+    {
+        let mut data = node.data.lock().unwrap();
+        data.funding_utxos.clear();
+        for _ in 0..2 {
+            crate::tests::mine(&mut data.blocks, None)?;
+        }
+    }
+    command(&dir, Operation::Sync { max_blocks: 1 })?;
+    let partial = command(&dir, Operation::Balance)?;
+    assert_eq!(partial["synced_height"], 11);
+    assert_eq!(partial["transparent"]["synced_height"], 10);
+    assert_eq!(partial["transparent"]["total_zat"], 1000);
+    assert_eq!(synced_balance(&dir)?["transparent"]["total_zat"], 0);
+
+    // Same-height replacement must not reuse the old tip's UTXO snapshot.
+    {
+        let mut data = node.data.lock().unwrap();
+        let tip = data.blocks.last_mut().unwrap();
+        tip.hash = "ee".repeat(32);
+        tip.transactions = vec!["44".repeat(32), "22".repeat(32)];
+        data.funding_utxos = vec![funding_utxo(&address, &"22".repeat(32), 0, 12, 2000)?];
+    }
+    let replaced = synced_balance(&dir)?;
+    assert_eq!(replaced["transparent"]["synced_hash"], "ee".repeat(32));
+    assert_eq!(replaced["transparent"]["available_zat"], 2000);
+
+    // A deeper reorg plus partial catch-up invalidates the old snapshot entirely.
+    {
+        let mut data = node.data.lock().unwrap();
+        data.blocks.truncate(3);
+        data.funding_utxos.clear();
+        for hash in ["aa", "bb"] {
+            crate::tests::mine(&mut data.blocks, None)?;
+            data.blocks.last_mut().unwrap().hash = hash.repeat(32);
+        }
+    }
+    command(&dir, Operation::Sync { max_blocks: 1 })?;
+    assert!(command(&dir, Operation::Balance)?["transparent"].is_null());
+    assert_eq!(synced_balance(&dir)?["transparent"]["total_zat"], 0);
+    Ok(())
+}
+
+#[test]
+fn funding_rpc_failures_and_tip_mismatches_roll_back_sync() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    init_wallet(&node, &dir)?;
+    let before = synced_balance(&dir)?;
+    {
+        let mut data = node.data.lock().unwrap();
+        crate::tests::mine(&mut data.blocks, None)?;
+        data.fail_funding_sync = true;
+    }
+    let error = command(&dir, Operation::Sync { max_blocks: 1000 }).unwrap_err();
+    assert!(error.to_string().contains("getaddressutxos"));
+    assert_eq!(command(&dir, Operation::Balance)?, before);
+    {
+        let mut data = node.data.lock().unwrap();
+        data.fail_funding_sync = false;
+        data.funding_hash_override = Some("ff".repeat(32));
+    }
+    let error = command(&dir, Operation::Sync { max_blocks: 1000 }).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not match the synced chain")
+    );
+    // Block 9 was downloaded but must also roll back, not just the funding data.
+    assert_eq!(command(&dir, Operation::Balance)?, before);
+    node.data.lock().unwrap().funding_hash_override = None;
+    assert_eq!(synced_balance(&dir)?["transparent"]["synced_height"], 9);
+    Ok(())
+}
+
+#[test]
+fn recent_pre_activation_funding_is_classified_without_tachyon_history() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    {
+        let mut data = node.data.lock().unwrap();
+        data.earlier_blocks.insert(
+            7,
+            json!({"height":7,"hash":"77".repeat(32),"tx":["11".repeat(32),"22".repeat(32)]}),
+        );
+        data.funding_utxos = vec![
+            funding_utxo(&address, &"11".repeat(32), 0, 7, 1000)?,
+            funding_utxo(&address, &"22".repeat(32), 0, 7, 2000)?,
+        ];
+    }
+    let balance = synced_balance(&dir)?;
+    assert_eq!(balance["transparent"]["immature_zat"], 1000);
+    assert_eq!(balance["transparent"]["available_zat"], 2000);
+    assert_eq!(balance["transparent"]["total_zat"], 3000);
+    Ok(())
+}
+
+#[test]
+fn transparent_reservations_survive_restart_until_after_expiry() -> Result<()> {
+    let node = Node::start()?;
+    node.data.lock().unwrap().blocks[0].transactions = vec!["44".repeat(32)];
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    node.data.lock().unwrap().funding_utxos =
+        vec![funding_utxo(&address, &"11".repeat(32), 0, 8, 700_000)?];
+    synced_balance(&dir)?;
+    {
+        let store = Store::open(&dir, false)?;
+        store.reserve(&Pending {
+            txid: "22".repeat(32),
+            raw: "00".into(),
+            expiry: 9,
+            source: format!("outpoint:{}:0", "11".repeat(32)),
+            receipt: None,
+        })?;
+        store.commit()?;
+    }
+    let reserved = command(&dir, Operation::Balance)?;
+    assert_eq!(reserved["transparent"]["reserved_zat"], 700_000);
+    assert_eq!(reserved["transparent"]["available_zat"], 0);
+    crate::tests::mine(&mut node.data.lock().unwrap().blocks, None)?;
+    assert_eq!(
+        synced_balance(&dir)?["transparent"]["reserved_zat"],
+        700_000
+    );
+    crate::tests::mine(&mut node.data.lock().unwrap().blocks, None)?;
+    let expired = synced_balance(&dir)?;
+    assert_eq!(expired["transparent"]["reserved_zat"], 0);
+    assert_eq!(expired["transparent"]["available_zat"], 700_000);
+    Ok(())
 }
 
 #[test]
@@ -204,13 +786,43 @@ fn two_wallet_rpc_flow_recovers_broadcast_failure_and_reorg() -> Result<()> {
     let mut raw = Vec::new();
     funding.write(&mut raw)?;
     node.data.lock().unwrap().raw_funding = hex::encode(raw);
-    command(
+    {
+        let mut data = node.data.lock().unwrap();
+        // The funding transaction is a regular transfer, not the first transaction in the block.
+        data.blocks[0].transactions = vec!["44".repeat(32), funding.txid().to_string()];
+        data.funding_utxos.push(funding_utxo(
+            alice_address["funding_address"].as_str().unwrap(),
+            &funding.txid().to_string(),
+            0,
+            8,
+            1_050_000,
+        )?);
+    }
+    assert_eq!(
+        synced_balance(&alice)?["transparent"]["available_zat"],
+        1_050_000
+    );
+    node.data.lock().unwrap().fail_submission = true;
+    let error = command(
         &alice,
         Operation::Shield {
-            txid: funding.txid().to_string(),
-            index: 0,
+            amount_zat: None,
+            txid: Some(funding.txid().to_string()),
+            index: Some(0),
         },
-    )?;
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("broadcast outcome may be ambiguous"));
+    node.data.lock().unwrap().fail_submission = false;
+    // A fresh command must still reserve the UTXO after an ambiguous broadcast.
+    assert_eq!(
+        command(&alice, Operation::Balance)?["transparent"]["reserved_zat"],
+        1_050_000
+    );
+    assert_eq!(
+        command(&alice, Operation::Balance)?["transparent"]["available_zat"],
+        0
+    );
     {
         let data = node.data.lock().unwrap();
         let tx = Transaction::read(&hex::decode(&data.mempool[0])?[..], BranchId::NuTachyon)?;
@@ -218,6 +830,10 @@ fn two_wallet_rpc_flow_recovers_broadcast_failure_and_reorg() -> Result<()> {
     }
     node.mine()?;
     assert_eq!(synced_balance(&alice)?["available_zat"], 1_000_000);
+    assert_eq!(
+        command(&alice, Operation::Balance)?["transparent"]["total_zat"],
+        0
+    );
     let bob_address = command(&bob, Operation::Address)?["tachyon_address"]
         .as_str()
         .unwrap()
@@ -296,12 +912,24 @@ fn two_wallet_rpc_flow_recovers_broadcast_failure_and_reorg() -> Result<()> {
         },
     )?;
     {
-        let data = node.data.lock().unwrap();
+        let mut data = node.data.lock().unwrap();
         let tx = Transaction::read(&hex::decode(&data.mempool[0])?[..], BranchId::NuTachyon)?;
         transaction::verify_for_test(&tx, None)?;
+        let height = data.blocks.last().unwrap().height + 1;
+        data.funding_utxos.push(funding_utxo(
+            alice_address["funding_address"].as_str().unwrap(),
+            &tx.txid().to_string(),
+            0,
+            height,
+            100_000,
+        )?);
     }
     node.mine()?;
     assert_eq!(synced_balance(&bob)?["available_zat"], 150_000);
+    assert_eq!(
+        synced_balance(&alice)?["transparent"]["available_zat"],
+        100_000
+    );
     Ok(())
 }
 

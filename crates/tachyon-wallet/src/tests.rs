@@ -104,7 +104,7 @@ pub(crate) fn shield(blocks: &[Block], receipt: &Receipt) -> Result<Transaction>
             ),
         }),
         outputs: std::slice::from_ref(receipt),
-        unshield: None,
+        transparent_output: None,
         expiry: blocks.last().unwrap().height + 20,
     })
 }
@@ -182,7 +182,7 @@ fn shield_transfer_change_and_unshield_roundtrip_with_valid_authorization() -> R
         spend: Some(&funded),
         funding: None,
         outputs: &[recipient, change.clone()],
-        unshield: None,
+        transparent_output: None,
         expiry: 30,
     })?;
     transaction::verify_for_test(&sent, None)?;
@@ -201,7 +201,7 @@ fn shield_transfer_change_and_unshield_roundtrip_with_valid_authorization() -> R
         spend: Some(&change),
         funding: None,
         outputs: &[],
-        unshield: Some((transaction::funding_address(SEED)?, 600_000)),
+        transparent_output: Some((transaction::funding_address(SEED)?, 600_000)),
         expiry: 30,
     })?;
     transaction::verify_for_test(&unshield, None)?;
@@ -235,7 +235,7 @@ fn old_note_spends_after_populated_and_empty_closed_epochs() -> Result<()> {
         spend: Some(&receipt),
         funding: None,
         outputs: &[own(950_000)],
-        unshield: None,
+        transparent_output: None,
         expiry: blocks.last().unwrap().height + 20,
     })?;
     transaction::verify_for_test(&sent, None)?;
@@ -254,7 +254,7 @@ fn spent_note_cannot_produce_closed_epoch_absence_evidence() -> Result<()> {
         spend: Some(&receipt),
         funding: None,
         outputs: &[own(950_000)],
-        unshield: None,
+        transparent_output: None,
         expiry: 30,
     })?;
     mine(&mut blocks, Some(&sent))?;

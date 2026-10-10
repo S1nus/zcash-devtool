@@ -1,6 +1,6 @@
 //! One SQLite writer lock covers selection and durable reservation of inputs.
 
-use crate::{chain::Block, note::Receipt};
+use crate::{chain::Block, funding_balance::Snapshot, note::Receipt};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -129,6 +129,33 @@ impl Store {
     pub fn pending(&self) -> Result<Vec<Pending>> {
         self.read_all("SELECT data FROM pending ORDER BY txid")
     }
+    pub fn funding_snapshot(&self) -> Result<Option<Snapshot>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='funding_snapshot')",
+            [], |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        self.conn
+            .query_row("SELECT data FROM funding_snapshot WHERE id=1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .map(|data| Ok(serde_json::from_str(&data)?))
+            .transpose()
+    }
+    pub fn put_funding_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
+        // Additive, lazy migration: existing v1 wallets remain readable before their next sync.
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS funding_snapshot (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);"
+        )?;
+        self.conn.execute(
+            "INSERT INTO funding_snapshot VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+            [serde_json::to_string(snapshot)?],
+        )?;
+        Ok(())
+    }
     fn read_all<T: serde::de::DeserializeOwned>(&self, sql: &str) -> Result<Vec<T>> {
         self.conn
             .prepare(sql)?
@@ -146,6 +173,12 @@ impl Store {
     pub fn rewind(&self, height: u32) -> Result<()> {
         self.conn
             .execute("DELETE FROM blocks WHERE height > ?", [height])?;
+        if self
+            .funding_snapshot()?
+            .is_some_and(|snapshot| snapshot.height > height)
+        {
+            self.conn.execute("DELETE FROM funding_snapshot", [])?;
+        }
         Ok(())
     }
     pub fn put_note(&self, receipt: &Receipt) -> Result<()> {
