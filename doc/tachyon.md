@@ -1,8 +1,8 @@
 # Experimental Tachyon wallets
 
 The optional `tachyon` command group supports direct Zakura RPC synchronization,
-shielding a transparent UTXO, sending Tachyon payments with change, and
-unshielding. Each wallet has its own persistent state and machine-readable JSON
+shielding a transparent UTXO, sending Tachyon payments with change, unshielding,
+and transparent-to-transparent transfers. Each wallet has its own persistent state and machine-readable JSON
 output. A later script or sidecar can operate several wallets; there is no
 random workload loop, miner, or automatic aggregation in devtool.
 
@@ -144,6 +144,24 @@ $DEVTOOL tachyon --wallet-dir ./bob unshield \
   --to TESTNET_TRANSPARENT_ADDRESS --amount-zat 100000
 ```
 
+After an unshielded output confirms, it can circulate transparently without a
+Tachyon bundle or any proof generation:
+
+```sh
+$DEVTOOL tachyon --wallet-dir ./alice transparent-send \
+  --to BOBS_FUNDING_ADDRESS --amount-zat 100000 --operation-id round-12:alice
+# After mining, Bob discovers the payment by syncing; no receipt import is needed.
+$DEVTOOL tachyon --wallet-dir ./bob sync
+```
+
+`transparent-send` uses the smallest eligible confirmed **non-coinbase** P2PKH
+UTXO, pays the recipient exactly `--amount-zat`, charges the additional 50,000-zatoshi
+fee, and returns any remainder to the sender's funding address. P2PKH and P2SH
+testnet recipients are supported. It does not combine inputs or spend unconfirmed
+change. Coinbase rewards must be shielded first, even if an output would fund the
+transfer exactly. Use the same wallet directories as the other `tachyon` commands,
+not the separate ordinary `wallet` command group.
+
 **Deliver receipts confidentially out of band.** They contain the recipient's
 note plaintext, not a spending key, but expose the amount and commitment
 opening. Tachyon does not currently provide an on-chain encrypted-note scanning
@@ -153,9 +171,49 @@ change are recorded automatically. Export never overwrites an existing file.
 
 ## Recovery and proof updates
 
+### Durable operation IDs for a sidecar
+
+All four payment commands (`shield`, `send`, `unshield`, `transparent-send`)
+accept optional `--operation-id ID`. IDs are unique **within a wallet**, and must
+contain 1–128 ASCII letters, digits, `-`, `_`, `.`, or `:`.
+
+```sh
+$DEVTOOL tachyon --wallet-dir ./alice send \
+  --to tachyon-test:BOBS_PAYMENT_KEY --amount-zat 100000 --operation-id round-13:alice
+# Offline lookup, including after a timeout or process restart:
+$DEVTOOL tachyon --wallet-dir ./alice operation round-13:alice
+```
+
+The ID and original request are committed atomically with signed transaction
+bytes, input reservation, and own note receipts **before broadcast**. Repeating
+the same ID and payment arguments returns the original transaction with
+`reused: true`, without contacting the node, creating another payment, or
+rebroadcasting. Different arguments with the same ID fail. Operation records
+remain bound to the original transaction after mining, reorgs, or expiry; a
+deliberate replacement requires a new ID. Explicit shielding txids are compared
+case-insensitively. Other request fields must match exactly.
+
+Lookup reports `txid`, the original `request`, `has_receipt`, `expiry_height`,
+and `status` (`pending`, `mined`, or `expired`) at the displayed `synced_height`.
+`pending` means saved but not observed mined; it does **not** confirm mempool
+acceptance. Run `sync` to refresh status, then `submit --txid TXID` to resend the
+same bytes when needed. A repeated expired operation returns `status: expired`
+and must not be interpreted as a successful new payment. `transactions` also
+includes each transaction's operation ID, or `null` when none was supplied.
+
+For crash recovery, the sidecar should persist its ID and request before invoking
+devtool. After an interrupted call, repeat that exact request with that ID. If
+the first attempt never committed, a payment is created; otherwise the original
+is returned. Deliver any Tachyon receipt using the recovered txid. Do not change
+IDs merely because broadcasting timed out. Existing v1 wallet databases gain the
+operation table lazily; no reset is required. No keys or receipt plaintexts are
+included in the operation response.
+
+### Reservations and proof synchronization
+
 Payments consume one sufficiently large note, create recipient/change output
 actions, and pay 50,000 zatoshis. Transparent funding uses one owned testnet
-P2PKH UTXO; unshielding supports testnet P2PKH or P2SH recipients. Multi-note
+P2PKH UTXO; unshielding and transparent sending support testnet P2PKH or P2SH recipients. Multi-note
 selection/consolidation, encrypted seed storage, memo transport and ordinary
 `wallet`/`inspect` integration are not implemented.
 
@@ -172,9 +230,10 @@ $DEVTOOL tachyon --wallet-dir ./alice export-receipt \
 ```
 
 Retry resends identical bytes. Reservations expire only after the synced tip
-passes the transaction expiry height. Payments expire within 20 blocks and
-never beyond the current epoch. At an epoch's last block, wait for its successor
-before sending. A reorganization rolls back stored public inputs; note and
+passes the transaction expiry height. Payments expire within 20 blocks. Payments
+with Tachyon data never expire beyond the current epoch; at an epoch's last block,
+wait for its successor before creating one. Transparent-only payments have no
+Tachyon epoch restriction. A reorganization rolls back stored public inputs; note and
 transaction states are recalculated, including mined transactions returning to
 pending. Concurrent commands against one wallet fail with a busy error rather
 than racing input selection; parallelize across wallets instead.

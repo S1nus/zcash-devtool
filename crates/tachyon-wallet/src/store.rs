@@ -33,6 +33,12 @@ pub struct Pending {
     pub receipt: Option<Receipt>,
 }
 
+pub struct StoredOperation {
+    pub id: String,
+    pub txid: String,
+    pub request: serde_json::Value,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -91,7 +97,7 @@ impl Store {
         );
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         conn.busy_timeout(Duration::from_secs(1))?;
-        conn.execute_batch("PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")?;
+        conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;")?;
         if initialize {
             conn.execute_batch(
                 "CREATE TABLE config (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
@@ -129,12 +135,62 @@ impl Store {
     pub fn pending(&self) -> Result<Vec<Pending>> {
         self.read_all("SELECT data FROM pending ORDER BY txid")
     }
-    pub fn funding_snapshot(&self) -> Result<Option<Snapshot>> {
-        let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='funding_snapshot')",
-            [], |row| row.get(0),
+    pub fn operation(&self, id: &str) -> Result<Option<StoredOperation>> {
+        if !self.table_exists("operations")? {
+            return Ok(None);
+        }
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT txid, request FROM operations WHERE id=?",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(txid, request)| {
+            Ok(StoredOperation {
+                id: id.into(),
+                txid,
+                request: serde_json::from_str(&request)?,
+            })
+        })
+        .transpose()
+    }
+    pub fn operation_ids(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        if !self.table_exists("operations")? {
+            return Ok(Default::default());
+        }
+        Ok(self
+            .conn
+            .prepare("SELECT txid, id FROM operations")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    pub fn put_operation(&self, operation: &StoredOperation) -> Result<()> {
+        // The ID, signed bytes, input reservation and receipts commit atomically before broadcast.
+        // Create lazily so older v1 wallets need no reset or eager migration.
+        self.conn.execute_batch("CREATE TABLE IF NOT EXISTS operations (
+            id TEXT PRIMARY KEY, txid TEXT NOT NULL UNIQUE REFERENCES pending(txid), request TEXT NOT NULL
+        );")?;
+        self.conn.execute(
+            "INSERT INTO operations VALUES(?, ?, ?)",
+            params![
+                operation.id,
+                operation.txid,
+                serde_json::to_string(&operation.request)?
+            ],
         )?;
-        if !exists {
+        Ok(())
+    }
+    fn table_exists(&self, table: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
+            [table],
+            |row| row.get(0),
+        )?)
+    }
+    pub fn funding_snapshot(&self) -> Result<Option<Snapshot>> {
+        if !self.table_exists("funding_snapshot")? {
             return Ok(None);
         }
         self.conn

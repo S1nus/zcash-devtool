@@ -49,7 +49,7 @@ pub(crate) fn mine(blocks: &mut Vec<Block>, tx: Option<&Transaction>) -> Result<
     };
     let mut after = entry;
     let mut stamps = Vec::new();
-    if let Some(tx) = tx {
+    if let Some(tx) = tx.filter(|tx| !matches!(tx.tachyon_bundle(), TachyonBundle::NoBundle)) {
         let TachyonBundle::Proven(bundle) = tx.tachyon_bundle() else {
             panic!("expected proven bundle")
         };
@@ -107,6 +107,77 @@ pub(crate) fn shield(blocks: &[Block], receipt: &Receipt) -> Result<Transaction>
         transparent_output: None,
         expiry: blocks.last().unwrap().height + 20,
     })
+}
+
+#[test]
+fn transparent_payment_signatures_cover_recipient_and_change_and_reject_foreign_funding()
+-> Result<()> {
+    let output = TxOut::new(
+        Zatoshis::from_u64(250_000)?,
+        transaction::transparent_script(&transaction::funding_address(SEED)?)?,
+    );
+    let recipient = bs58::encode([&[0x1c, 0xba][..], &[9; 20]].concat())
+        .with_check()
+        .into_string();
+    let tx = transaction::build_transparent(
+        SEED,
+        Funding {
+            outpoint: OutPoint::new([2; 32], 0),
+            output: output.clone(),
+        },
+        &recipient,
+        100_000,
+        28,
+    )?;
+    assert!(matches!(tx.tachyon_bundle(), TachyonBundle::NoBundle));
+    let bundle = tx.transparent_bundle().unwrap();
+    assert_eq!(bundle.vout.len(), 2);
+    assert_eq!(
+        bundle.vout[0].script_pubkey(),
+        &transaction::transparent_script(&recipient)?
+    );
+    assert_eq!(bundle.vout[1].value().into_u64(), 100_000);
+    let mut bytes = Vec::new();
+    tx.write(&mut bytes)?;
+    let decoded = Transaction::read(&bytes[..], BranchId::NuTachyon)?;
+    assert_eq!(decoded.txid(), tx.txid());
+    transaction::verify_for_test(&decoded, Some(output.clone()))?;
+    for index in [0, 1] {
+        let mut changed = bundle.clone();
+        changed.vout[index] = TxOut::new(
+            Zatoshis::from_u64(99_999)?,
+            changed.vout[index].script_pubkey().clone(),
+        );
+        let tampered = primitives::transaction::TransactionData::<
+            primitives::transaction::Authorized,
+        >::from_parts_v7(
+            BranchId::NuTachyon,
+            0,
+            tx.expiry_height(),
+            Zatoshis::ZERO,
+            Some(changed),
+            None,
+            None,
+            None,
+            TachyonBundle::NoBundle,
+        )
+        .freeze()?;
+        assert!(transaction::verify_for_test(&tampered, Some(output.clone())).is_err());
+    }
+    assert!(
+        transaction::build_transparent(
+            [8; 32],
+            Funding {
+                outpoint: OutPoint::new([2; 32], 0),
+                output
+            },
+            &recipient,
+            100_000,
+            28
+        )
+        .is_err()
+    );
+    Ok(())
 }
 
 #[test]

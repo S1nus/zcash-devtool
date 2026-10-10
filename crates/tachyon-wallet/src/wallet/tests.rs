@@ -21,6 +21,7 @@ struct NodeData {
     txout_overrides: BTreeMap<(String, u32), Value>,
     mempool: Vec<String>,
     fail_submission: bool,
+    submissions: usize,
     funding_utxos: Vec<Value>,
     fail_funding_sync: bool,
     funding_hash_override: Option<String>,
@@ -50,6 +51,7 @@ impl Node {
             txout_overrides: BTreeMap::new(),
             mempool: vec![],
             fail_submission: false,
+            submissions: 0,
             funding_utxos: vec![],
             fail_funding_sync: false,
             funding_hash_override: None,
@@ -156,6 +158,7 @@ impl Node {
                             .unwrap_or(&data.raw_funding)
                     ),
                     "sendrawtransaction" => {
+                        data.submissions += 1;
                         let raw = params[0].as_str().unwrap().to_owned();
                         let tx =
                             Transaction::read(&hex::decode(&raw).unwrap()[..], BranchId::NuTachyon)
@@ -190,7 +193,8 @@ impl Node {
     fn mine(&self) -> Result<()> {
         let mut data = self.data.lock().unwrap();
         let raw = data.mempool.remove(0);
-        let tx = Transaction::read(&hex::decode(raw)?[..], BranchId::NuTachyon)?;
+        let tx = Transaction::read(&hex::decode(&raw)?[..], BranchId::NuTachyon)?;
+        data.raw_transactions.insert(tx.txid().to_string(), raw);
         if let Some(bundle) = tx.transparent_bundle() {
             for input in &bundle.vin {
                 let txid =
@@ -208,14 +212,421 @@ impl Node {
         }
         Ok(())
     }
+    fn mine_to(&self, addresses: &[&str]) -> Result<Transaction> {
+        let tx = {
+            let mut data = self.data.lock().unwrap();
+            let tx = Transaction::read(&hex::decode(&data.mempool[0])?[..], BranchId::NuTachyon)?;
+            let height = data.blocks.last().unwrap().height + 1;
+            if let Some(bundle) = tx.transparent_bundle() {
+                for (index, output) in bundle.vout.iter().enumerate() {
+                    for address in addresses {
+                        if *output.script_pubkey() == transaction::transparent_script(address)? {
+                            data.funding_utxos.push(funding_utxo(
+                                address,
+                                &tx.txid().to_string(),
+                                u32::try_from(index)?,
+                                height,
+                                output.value().into_u64(),
+                            )?);
+                        }
+                    }
+                }
+            }
+            tx
+        };
+        self.mine()?;
+        Ok(tx)
+    }
 }
 
 fn command(dir: &std::path::Path, command: Operation) -> Result<Value> {
+    command_with_id(dir, command, None)
+}
+fn command_with_id(dir: &std::path::Path, command: Operation, id: Option<&str>) -> Result<Value> {
     Command {
         wallet_dir: dir.into(),
+        operation_id: id.map(str::to_owned),
         command,
     }
     .execute()
+}
+
+fn transparent_send(to: &str, amount_zat: u64) -> Operation {
+    Operation::TransparentSend {
+        to: to.into(),
+        amount_zat,
+    }
+}
+
+#[test]
+fn transparent_payments_return_change_cycle_between_wallets_and_reshield() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let alice = temp.path().join("alice");
+    let bob = temp.path().join("bob");
+    let alice_address = init_wallet(&node, &alice)?;
+    let bob_address = init_wallet(&node, &bob)?;
+    let funding = install_funding(&node, &alice_address, &[250_000, 550_000, 150_000])?;
+    let result = command_with_id(
+        &alice,
+        transparent_send(&bob_address, 150_000),
+        Some("round-1:alice"),
+    )?;
+    assert_eq!(result["operation_id"], "round-1:alice");
+    assert_eq!(result["reused"], false);
+    let tx = node.mine_to(&[&alice_address, &bob_address])?;
+    assert!(matches!(tx.tachyon_bundle(), TachyonBundle::NoBundle));
+    let bundle = tx.transparent_bundle().unwrap();
+    assert_eq!(bundle.vin[0].prevout().n(), 0);
+    assert_eq!(bundle.vout.len(), 2);
+    assert_eq!(bundle.vout[0].value().into_u64(), 150_000);
+    assert_eq!(bundle.vout[1].value().into_u64(), 50_000);
+    transaction::verify_for_test(
+        &tx,
+        Some(funding.transparent_bundle().unwrap().vout[0].clone()),
+    )?;
+    assert_eq!(
+        synced_balance(&alice)?["transparent"]["available_zat"],
+        750_000
+    );
+    let balance = synced_balance(&bob)?;
+    assert_eq!(balance["transparent"]["available_zat"], 150_000);
+    assert_eq!(balance["available_zat"], 0);
+    assert_eq!(
+        command(
+            &alice,
+            Operation::Lookup {
+                id: "round-1:alice".into()
+            }
+        )?["status"],
+        "mined"
+    );
+    command(&bob, transparent_send(&alice_address, 100_000))?;
+    let returned = node.mine_to(&[&alice_address, &bob_address])?;
+    assert_eq!(returned.transparent_bundle().unwrap().vout.len(), 1); // Exact funding: no change.
+    transaction::verify_for_test(&returned, Some(bundle.vout[0].clone()))?;
+    assert_eq!(synced_balance(&bob)?["transparent"]["total_zat"], 0);
+    command_with_id(
+        &alice,
+        Operation::Shield {
+            amount_zat: None,
+            txid: Some(returned.txid().to_string()),
+            index: Some(0),
+        },
+        Some("reshield"),
+    )?;
+    node.mine_to(&[&alice_address, &bob_address])?;
+    assert_eq!(synced_balance(&alice)?["available_zat"], 50_000);
+    assert_eq!(
+        command(
+            &alice,
+            Operation::Lookup {
+                id: "reshield".into()
+            }
+        )?["request"]["kind"],
+        "shield"
+    );
+    Ok(())
+}
+
+#[test]
+fn operation_id_recovers_ambiguous_broadcast_and_replays_without_network() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    install_funding(&node, &address, &[250_000])?;
+    let to = transaction::funding_address(crate::tests::SEED)?;
+    node.data.lock().unwrap().fail_submission = true;
+    assert!(command_with_id(&dir, transparent_send(&to, 100_000), Some("job:1")).is_err());
+    let saved = command(&dir, Operation::Lookup { id: "job:1".into() })?;
+    assert_eq!(saved["status"], "pending");
+    let pending = Store::open(&dir, false)?.pending()?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(saved["txid"], pending[0].txid);
+    assert_eq!(pending[0].raw, node.data.lock().unwrap().mempool[0]);
+    assert_eq!(
+        command(&dir, Operation::Balance)?["transparent"]["reserved_zat"],
+        250_000
+    );
+    let reused = command_with_id(&dir, transparent_send(&to, 100_000), Some("job:1"))?;
+    assert_eq!(reused["txid"], saved["txid"]);
+    assert_eq!(reused["reused"], true);
+    assert_eq!(node.data.lock().unwrap().submissions, 1);
+    drop(node);
+    // Neither lookup nor replay require the node, even after the ambiguous submission.
+    assert_eq!(
+        command(&dir, Operation::Lookup { id: "job:1".into() })?,
+        saved
+    );
+    assert_eq!(
+        command_with_id(&dir, transparent_send(&to, 100_000), Some("job:1"))?,
+        reused
+    );
+    for operation in [
+        transparent_send(&to, 100_001),
+        transparent_send(&address, 100_000),
+        Operation::Unshield {
+            to: to.clone(),
+            amount_zat: 100_000,
+        },
+    ] {
+        let error = command_with_id(&dir, operation, Some("job:1")).unwrap_err();
+        assert!(error.to_string().contains("different payment request"));
+    }
+    assert_eq!(Store::open(&dir, false)?.pending()?.len(), 1);
+    assert_eq!(
+        command(&dir, Operation::Transactions)?["transactions"][0]["operation_id"],
+        "job:1"
+    );
+    Ok(())
+}
+
+#[test]
+fn operation_id_and_reserved_transaction_commit_or_roll_back_together() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let pending = Pending {
+        txid: "11".repeat(32),
+        raw: "00".into(),
+        expiry: 20,
+        source: "outpoint:test:0".into(),
+        receipt: None,
+    };
+    let operation = StoredOperation {
+        id: "atomic".into(),
+        txid: pending.txid.clone(),
+        request: json!({"kind":"test"}),
+    };
+    {
+        let store = Store::open(&dir, true)?;
+        store.commit()?;
+    }
+    {
+        let store = Store::open(&dir, false)?;
+        assert!(store.operation("atomic")?.is_none()); // Old v1 schema is readable.
+        store.reserve(&pending)?;
+        store.put_note(&crate::tests::own(100_000))?;
+        store.put_operation(&operation)?;
+        // Simulate interruption before COMMIT. No signed transaction could have been broadcast.
+    }
+    {
+        let store = Store::open(&dir, false)?;
+        assert!(store.pending()?.is_empty());
+        assert!(store.notes()?.is_empty());
+        assert!(store.operation("atomic")?.is_none());
+        store.reserve(&pending)?;
+        store.put_operation(&operation)?;
+        store.commit()?;
+    }
+    // Simulate a restart after COMMIT but before broadcast: the same bytes remain recoverable.
+    {
+        let store = Store::open(&dir, false)?;
+        assert_eq!(store.operation("atomic")?.unwrap().txid, pending.txid);
+        assert_eq!(store.pending()?[0].raw, pending.raw);
+        let replacement = Pending {
+            txid: "22".repeat(32),
+            ..pending
+        };
+        store.reserve(&replacement)?;
+        assert!(
+            store
+                .put_operation(&StoredOperation {
+                    txid: replacement.txid,
+                    ..operation
+                })
+                .is_err()
+        );
+    }
+    assert_eq!(Store::open(&dir, false)?.pending()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn operation_id_survives_mining_reorg_and_expiry_without_becoming_reusable() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    let funding = install_funding(&node, &address, &[250_000])?;
+    let to = transaction::funding_address(crate::tests::SEED)?;
+    let original = command_with_id(&dir, transparent_send(&to, 100_000), Some("stable"))?;
+    node.mine_to(&[&address])?;
+    synced_balance(&dir)?;
+    assert_eq!(
+        command_with_id(&dir, transparent_send(&to, 100_000), Some("stable"))?["status"],
+        "mined"
+    );
+    {
+        let mut data = node.data.lock().unwrap();
+        data.blocks.pop();
+        crate::tests::mine(&mut data.blocks, None)?;
+        data.blocks.last_mut().unwrap().hash = "99".repeat(32);
+        data.funding_utxos = vec![funding_utxo(
+            &address,
+            &funding.txid().to_string(),
+            0,
+            8,
+            250_000,
+        )?];
+    }
+    synced_balance(&dir)?;
+    assert_eq!(
+        command(
+            &dir,
+            Operation::Lookup {
+                id: "stable".into()
+            }
+        )?["status"],
+        "pending"
+    );
+    {
+        let mut data = node.data.lock().unwrap();
+        while u64::from(data.blocks.last().unwrap().height)
+            <= original["expiry_height"].as_u64().unwrap()
+        {
+            crate::tests::mine(&mut data.blocks, None)?;
+        }
+    }
+    synced_balance(&dir)?;
+    let expired = command_with_id(&dir, transparent_send(&to, 100_000), Some("stable"))?;
+    assert_eq!(expired["status"], "expired");
+    assert_eq!(expired["txid"], original["txid"]);
+    assert_eq!(node.data.lock().unwrap().submissions, 1);
+    assert!(
+        command(
+            &dir,
+            Operation::Submit {
+                txid: original["txid"].as_str().unwrap().into()
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(
+        command(&dir, Operation::Balance)?["transparent"]["available_zat"],
+        250_000
+    );
+    command_with_id(&dir, transparent_send(&to, 100_000), Some("replacement"))?;
+    assert_eq!(Store::open(&dir, false)?.pending()?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn transparent_send_rejects_coinbase_inputs_even_with_exact_funding() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    let funding = install_funding(&node, &address, &[150_000])?;
+    node.data.lock().unwrap().txout_overrides.insert(
+        (funding.txid().to_string(), 0),
+        json!({"coinbase":true,"confirmations":100}),
+    );
+    let error =
+        command_with_id(&dir, transparent_send(&address, 100_000), Some("coinbase")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("coinbase outputs must be shielded")
+    );
+    assert!(Store::open(&dir, false)?.operation("coinbase")?.is_none());
+    assert_eq!(node.data.lock().unwrap().submissions, 0);
+    Ok(())
+}
+
+#[test]
+fn operation_ids_are_bounded_and_only_apply_to_payments() -> Result<()> {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        wallet: Command,
+    }
+    let args = [
+        "test",
+        "--wallet-dir",
+        "unused",
+        "transparent-send",
+        "--to",
+        "ADDRESS",
+        "--amount-zat",
+        "100000",
+        "--operation-id",
+        "round:1",
+    ];
+    assert_eq!(
+        Cli::try_parse_from(args)?.wallet.operation_id.as_deref(),
+        Some("round:1")
+    );
+    let args = [
+        "test",
+        "--wallet-dir",
+        "unused",
+        "--operation-id",
+        "round:1",
+        "shield",
+        "100000",
+    ];
+    assert_eq!(
+        Cli::try_parse_from(args)?.wallet.operation_id.as_deref(),
+        Some("round:1")
+    );
+    let args = ["test", "--wallet-dir", "unused", "operation", "round:1"];
+    assert!(matches!(
+        Cli::try_parse_from(args)?.wallet.command,
+        Operation::Lookup { .. }
+    ));
+    for id in [
+        "".to_owned(),
+        "x".repeat(129),
+        "has space".into(),
+        "has\nnewline".into(),
+        "unicode💫".into(),
+    ] {
+        assert!(validate_operation_id(&id).is_err());
+    }
+    assert!(validate_operation_id(&"x".repeat(128)).is_ok());
+    let error = command_with_id(
+        std::path::Path::new("unused"),
+        Operation::Balance,
+        Some("round:1"),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("only supported for payment creation")
+    );
+    Ok(())
+}
+
+#[test]
+fn transparent_send_is_not_blocked_by_a_tachyon_epoch_boundary() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    install_funding(&node, &address, &[150_000])?;
+    {
+        let mut data = node.data.lock().unwrap();
+        while data.blocks.last().unwrap().height < 8 + EPOCH_SIZE - 1 {
+            crate::tests::mine(&mut data.blocks, None)?;
+        }
+        let store = Store::open(&dir, false)?;
+        for block in &data.blocks[1..] {
+            store.put_block(block)?;
+        }
+        store.commit()?;
+    }
+    let result = command(&dir, transparent_send(&address, 100_000))?;
+    assert_eq!(result["expiry_height"], 8 + EPOCH_SIZE - 1 + 20);
+    let tx = node.mine_to(&[&address])?;
+    assert!(matches!(tx.tachyon_bundle(), TachyonBundle::NoBundle));
+    assert_eq!(
+        synced_balance(&dir)?["transparent"]["available_zat"],
+        100_000
+    );
+    Ok(())
 }
 fn synced_balance(dir: &std::path::Path) -> Result<Value> {
     command(dir, Operation::Sync { max_blocks: 1000 })?;
@@ -803,13 +1214,14 @@ fn two_wallet_rpc_flow_recovers_broadcast_failure_and_reorg() -> Result<()> {
         1_050_000
     );
     node.data.lock().unwrap().fail_submission = true;
-    let error = command(
+    let error = command_with_id(
         &alice,
         Operation::Shield {
             amount_zat: None,
             txid: Some(funding.txid().to_string()),
             index: Some(0),
         },
+        Some("initial-shield"),
     )
     .unwrap_err();
     assert!(format!("{error:#}").contains("broadcast outcome may be ambiguous"));
@@ -840,17 +1252,36 @@ fn two_wallet_rpc_flow_recovers_broadcast_failure_and_reorg() -> Result<()> {
         .to_owned();
     node.data.lock().unwrap().fail_submission = true;
     assert!(
-        command(
+        command_with_id(
             &alice,
             Operation::Send {
                 to: bob_address.clone(),
                 amount_zat: 300_000
-            }
+            },
+            Some("alice-to-bob"),
         )
         .is_err()
     );
     // Every command reopens SQLite: reservation and raw bytes survive process boundaries.
     assert_eq!(command(&alice, Operation::Balance)?["available_zat"], 0);
+    let saved = command(
+        &alice,
+        Operation::Lookup {
+            id: "alice-to-bob".into(),
+        },
+    )?;
+    assert_eq!(saved["has_receipt"], true);
+    assert_eq!(saved["request"]["kind"], "send");
+    let replay = command_with_id(
+        &alice,
+        Operation::Send {
+            to: bob_address.clone(),
+            amount_zat: 300_000,
+        },
+        Some("alice-to-bob"),
+    )?;
+    assert_eq!(replay["txid"], saved["txid"]);
+    assert_eq!(replay["reused"], true);
     assert!(
         command(
             &alice,
@@ -904,13 +1335,23 @@ fn two_wallet_rpc_flow_recovers_broadcast_failure_and_reorg() -> Result<()> {
     command(&alice, Operation::Submit { txid })?;
     node.mine()?;
     assert_eq!(synced_balance(&bob)?["available_zat"], 300_000);
-    command(
+    command_with_id(
         &bob,
         Operation::Unshield {
             to: alice_address["funding_address"].as_str().unwrap().into(),
             amount_zat: 100_000,
         },
+        Some("bob-unshield"),
     )?;
+    assert_eq!(
+        command(
+            &bob,
+            Operation::Lookup {
+                id: "bob-unshield".into()
+            }
+        )?["request"]["kind"],
+        "unshield"
+    );
     {
         let mut data = node.data.lock().unwrap();
         let tx = Transaction::read(&hex::decode(&data.mempool[0])?[..], BranchId::NuTachyon)?;

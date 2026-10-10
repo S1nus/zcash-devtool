@@ -5,7 +5,7 @@ use crate::{
     funding_balance::{AddressUtxos, COINBASE_MATURITY},
     note::{self, Receipt},
     rpc::Rpc,
-    store::{Config, Pending, Store, write_private},
+    store::{Config, Pending, Store, StoredOperation, write_private},
     transaction::{self, FEE, Funding, Payment},
 };
 use anyhow::{Context, Result, ensure};
@@ -28,6 +28,9 @@ pub struct Command {
     /// Separate, private directory for this experimental wallet (not the ordinary wallet DB).
     #[arg(long)]
     wallet_dir: PathBuf,
+    /// Optional wallet-local idempotency key for shield/send/unshield/transparent-send.
+    #[arg(long, global = true)]
+    operation_id: Option<String>,
     #[command(subcommand)]
     command: Operation,
 }
@@ -86,6 +89,16 @@ enum Operation {
         #[arg(long)]
         amount_zat: u64,
     },
+    /// Send transparent funds from one confirmed non-coinbase UTXO, with transparent change.
+    TransparentSend {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        amount_zat: u64,
+    },
+    /// Look up a saved operation ID offline; status is based on the last successful sync.
+    #[command(name = "operation")]
+    Lookup { id: String },
     /// Export the recipient's confidential note receipt, including after a failed broadcast.
     ExportReceipt {
         #[arg(long)]
@@ -110,6 +123,19 @@ impl Command {
     }
 
     fn execute(self) -> Result<Value> {
+        if let Some(id) = &self.operation_id {
+            validate_operation_id(id)?;
+            ensure!(
+                matches!(
+                    self.command,
+                    Operation::Shield { .. }
+                        | Operation::Send { .. }
+                        | Operation::Unshield { .. }
+                        | Operation::TransparentSend { .. }
+                ),
+                "--operation-id is only supported for payment creation; use operation <id> for lookup"
+            );
+        }
         if let Operation::Init {
             rpc_url,
             activation_height,
@@ -216,9 +242,15 @@ impl Command {
             }
             Operation::Transactions => {
                 let blocks = store.blocks()?;
+                let ids = store.operation_ids()?;
                 json!({"transactions":store.pending()?.into_iter().map(|p| {
-                    json!({"txid":p.txid,"expiry_height":p.expiry,"status":pending_status(&p,&blocks)})
+                    json!({"txid":p.txid,"operation_id":ids.get(&p.txid),"expiry_height":p.expiry,"status":pending_status(&p,&blocks)})
                 }).collect::<Vec<_>>()})
+            }
+            Operation::Lookup { id } => {
+                validate_operation_id(&id)?;
+                let saved = store.operation(&id)?.context("unknown operation ID")?;
+                operation_result(&store, &saved)?
             }
             Operation::Submit { txid } => {
                 ensure!(
@@ -242,8 +274,9 @@ impl Command {
             }
             operation @ (Operation::Shield { .. }
             | Operation::Send { .. }
-            | Operation::Unshield { .. }) => {
-                return pay(&store, &config, operation);
+            | Operation::Unshield { .. }
+            | Operation::TransparentSend { .. }) => {
+                return pay(&store, &config, operation, self.operation_id.as_deref());
             }
         };
         store.commit()?;
@@ -379,8 +412,30 @@ fn note_states(
         .collect()
 }
 
-fn pay(store: &Store, config: &Config, operation: Operation) -> Result<Value> {
-    match &operation {
+fn validate_operation_id(id: &str) -> Result<()> {
+    ensure!(
+        !id.is_empty()
+            && id.len() <= 128
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b)),
+        "operation ID must be 1-128 ASCII letters, digits, '-', '_', '.', or ':'"
+    );
+    Ok(())
+}
+
+fn operation_result(store: &Store, saved: &StoredOperation) -> Result<Value> {
+    let pending = find_pending(store, &saved.txid)?;
+    let blocks = store.blocks()?;
+    Ok(
+        json!({"operation_id":saved.id,"txid":saved.txid,"request":saved.request,
+        "status":pending_status(&pending,&blocks),"synced_height":blocks.last().map(|b| b.height),
+        "expiry_height":pending.expiry,"fee_zat":FEE,"has_receipt":pending.receipt.is_some()}),
+    )
+}
+
+fn payment_request(operation: &Operation) -> Result<Value> {
+    let request = match operation {
         Operation::Shield {
             amount_zat,
             txid,
@@ -394,26 +449,56 @@ fn pay(store: &Store, config: &Config, operation: Operation) -> Result<Value> {
                 amount_zat.is_some() || txid.is_some(),
                 "provide an amount or both --txid and --index"
             );
-            if let Some(amount) = amount_zat {
-                ensure!(*amount > 0, "amount must be positive");
-                protocol::value::Zatoshis::from_u64(
-                    amount
-                        .checked_add(FEE)
-                        .context("amount plus fee overflow")?,
-                )
-                .context("amount plus fee exceeds the monetary range")?;
-            }
             if let Some(txid) = txid {
                 bytes32(txid)?;
             }
+            json!({"kind":"shield","amount_zat":amount_zat,"txid":txid.as_ref().map(|id| id.to_ascii_lowercase()),"index":index})
         }
-        Operation::Send { to, .. } => {
+        Operation::Send { to, amount_zat } => {
             note::decode_address(to)?;
+            json!({"kind":"send","to":to,"amount_zat":amount_zat})
         }
-        Operation::Unshield { to, .. } => {
+        Operation::Unshield { to, amount_zat } | Operation::TransparentSend { to, amount_zat } => {
             transaction::transparent_script(to)?;
+            let kind = if matches!(operation, Operation::Unshield { .. }) {
+                "unshield"
+            } else {
+                "transparent-send"
+            };
+            json!({"kind":kind,"to":to,"amount_zat":amount_zat})
         }
-        _ => {}
+        _ => anyhow::bail!("not a payment operation"),
+    };
+    if let Some(amount) = request["amount_zat"].as_u64() {
+        ensure!(amount > 0, "amount must be positive");
+        protocol::value::Zatoshis::from_u64(
+            amount
+                .checked_add(FEE)
+                .context("amount plus fee overflow")?,
+        )
+        .context("amount plus fee exceeds the monetary range")?;
+    }
+    Ok(request)
+}
+
+fn pay(
+    store: &Store,
+    config: &Config,
+    operation: Operation,
+    operation_id: Option<&str>,
+) -> Result<Value> {
+    let request = payment_request(&operation)?;
+    if let Some(id) = operation_id
+        && let Some(saved) = store.operation(id)?
+    {
+        ensure!(
+            saved.request == request,
+            "operation ID already belongs to a different payment request"
+        );
+        let mut result = operation_result(store, &saved)?;
+        result["reused"] = json!(true);
+        store.commit()?;
+        return Ok(result); // Offline: never reselect inputs, rebuild proofs, or rebroadcast.
     }
     ensure!(
         sync(store, config, 1000)?["caught_up"] == true,
@@ -431,11 +516,16 @@ fn pay(store: &Store, config: &Config, operation: Operation) -> Result<Value> {
         )
         .and_then(|h| h.checked_sub(1))
         .context("height overflow")?;
+    let transparent_only = matches!(operation, Operation::TransparentSend { .. });
     ensure!(
-        tip.height < epoch_end,
+        transparent_only || tip.height < epoch_end,
         "wait for the next epoch's first block before sending"
     );
-    let expiry = tip.height.saturating_add(20).min(epoch_end);
+    let expiry = if transparent_only {
+        tip.height.saturating_add(20)
+    } else {
+        tip.height.saturating_add(20).min(epoch_end)
+    };
     let own_address = note::address(&SpendingKey::from(config.seed));
     let mut outputs = Vec::new();
     let mut spend = None;
@@ -460,6 +550,7 @@ fn pay(store: &Store, config: &Config, operation: Operation) -> Result<Value> {
                         .context("automatic selection requires an amount")?
                         .checked_add(FEE)
                         .context("amount plus fee overflow")?,
+                    FundingPurpose::Shield,
                 )?,
                 _ => anyhow::bail!("--txid and --index must be provided together"),
             };
@@ -471,34 +562,9 @@ fn pay(store: &Store, config: &Config, operation: Operation) -> Result<Value> {
                     .any(|p| p.source == source && pending_status(p, &blocks) != "expired"),
                 "funding output is already reserved"
             );
-            let available: Value = rpc.call("gettxout", json!([txid, index, true]))?;
-            ensure!(
-                !available.is_null(),
-                "funding output is unavailable or already spent"
-            );
-            let confirmations = available["confirmations"]
-                .as_u64()
-                .context("missing confirmations")?;
-            let coinbase = available["coinbase"]
-                .as_bool()
-                .context("missing coinbase flag")?;
-            ensure!(
-                confirmations >= if coinbase { COINBASE_MATURITY } else { 1 },
-                "funding output is not mature/confirmed"
-            );
-            let raw: String = rpc.call("getrawtransaction", json!([txid, 0]))?;
-            let bytes = hex::decode(raw)?;
-            let previous = Transaction::read(&bytes[..], BranchId::NuTachyon)?;
-            ensure!(
-                previous.txid().to_string() == txid,
-                "funding transaction ID mismatch"
-            );
-            let output = previous
-                .transparent_bundle()
-                .and_then(|b| b.vout.get(usize::try_from(index).ok()?))
-                .context("funding output missing")?
-                .clone();
-            let after_fee = output
+            let (selected, coinbase) = load_funding(&rpc, config.seed, &txid, index)?;
+            let after_fee = selected
+                .output
                 .value()
                 .into_u64()
                 .checked_sub(FEE)
@@ -516,10 +582,27 @@ fn pay(store: &Store, config: &Config, operation: Operation) -> Result<Value> {
                 transparent_output = Some((transaction::funding_address(config.seed)?, change));
             }
             outputs.push(Receipt::new(&config.network_id, &own_address, amount)?);
-            funding = Some(Funding {
-                outpoint: transparent::bundle::OutPoint::new(*previous.txid().as_ref(), index),
-                output,
-            });
+            funding = Some(selected);
+        }
+        Operation::TransparentSend { to, amount_zat } => {
+            let needed = amount_zat
+                .checked_add(FEE)
+                .context("amount plus fee overflow")?;
+            let (txid, index) = select_funding_outpoint(
+                store,
+                &blocks,
+                &rpc,
+                needed,
+                FundingPurpose::TransparentSend,
+            )?;
+            source = format!("outpoint:{txid}:{index}");
+            let (selected, coinbase) = load_funding(&rpc, config.seed, &txid, index)?;
+            ensure!(
+                !coinbase,
+                "coinbase outputs must be shielded before transparent transfers"
+            );
+            funding = Some(selected);
+            transparent_output = Some((to, amount_zat));
         }
         Operation::Send { to, amount_zat } | Operation::Unshield { to, amount_zat } => {
             ensure!(amount_zat > 0, "amount must be positive");
@@ -544,15 +627,26 @@ fn pay(store: &Store, config: &Config, operation: Operation) -> Result<Value> {
         }
         _ => anyhow::bail!("not a payment operation"),
     }
-    let tx = transaction::build(Payment {
-        seed: config.seed,
-        blocks: &blocks,
-        spend: spend.as_ref(),
-        funding,
-        outputs: &outputs,
-        transparent_output,
-        expiry,
-    })?;
+    let tx = if transparent_only {
+        let (to, amount) = transparent_output.context("transparent payment has a recipient")?;
+        transaction::build_transparent(
+            config.seed,
+            funding.context("transparent payment has funding")?,
+            &to,
+            amount,
+            expiry,
+        )?
+    } else {
+        transaction::build(Payment {
+            seed: config.seed,
+            blocks: &blocks,
+            spend: spend.as_ref(),
+            funding,
+            outputs: &outputs,
+            transparent_output,
+            expiry,
+        })?
+    };
     ensure!(
         rpc.hash(tip.height)? == tip.hash && rpc.height()? <= expiry,
         "chain changed or transaction expired during proving; sync and retry"
@@ -573,14 +667,69 @@ fn pay(store: &Store, config: &Config, operation: Operation) -> Result<Value> {
         receipt: recipient,
     };
     store.reserve(&pending)?;
+    if let Some(id) = operation_id {
+        store.put_operation(&StoredOperation {
+            id: id.into(),
+            txid: txid.clone(),
+            request,
+        })?;
+    }
     // A timeout is not a rejection: commit both change receipts and the reservation BEFORE broadcast.
     store.commit()?;
     rpc.submit(&txid, &pending.raw).with_context(|| {
         format!("transaction {txid} saved; use transactions/submit/export-receipt to recover")
     })?;
     Ok(
-        json!({"txid":txid,"status":"submitted","fee_zat":FEE,"expiry_height":expiry,"has_receipt":pending.receipt.is_some()}),
+        json!({"txid":txid,"operation_id":operation_id,"reused":false,"status":"submitted","fee_zat":FEE,"expiry_height":expiry,"has_receipt":pending.receipt.is_some()}),
     )
+}
+
+#[derive(Clone, Copy)]
+enum FundingPurpose {
+    Shield,
+    TransparentSend,
+}
+
+fn load_funding(rpc: &Rpc, seed: [u8; 32], txid: &str, index: u32) -> Result<(Funding, bool)> {
+    let available: Value = rpc.call("gettxout", json!([txid, index, true]))?;
+    ensure!(
+        !available.is_null(),
+        "funding output is unavailable or already spent"
+    );
+    let confirmations = available["confirmations"]
+        .as_u64()
+        .context("missing confirmations")?;
+    let coinbase = available["coinbase"]
+        .as_bool()
+        .context("missing coinbase flag")?;
+    ensure!(
+        confirmations >= if coinbase { COINBASE_MATURITY } else { 1 },
+        "funding output is not mature/confirmed"
+    );
+    let raw: String = rpc.call("getrawtransaction", json!([txid, 0]))?;
+    let bytes = hex::decode(raw)?;
+    let previous = Transaction::read(&bytes[..], BranchId::NuTachyon)?;
+    ensure!(
+        previous.txid().to_string() == txid,
+        "funding transaction ID mismatch"
+    );
+    let output = previous
+        .transparent_bundle()
+        .and_then(|bundle| bundle.vout.get(usize::try_from(index).ok()?))
+        .context("funding output missing")?
+        .clone();
+    ensure!(
+        *output.script_pubkey()
+            == transaction::transparent_script(&transaction::funding_address(seed)?)?,
+        "funding output is not owned by this wallet"
+    );
+    Ok((
+        Funding {
+            outpoint: transparent::bundle::OutPoint::new(*previous.txid().as_ref(), index),
+            output,
+        },
+        coinbase,
+    ))
 }
 
 fn select_funding_outpoint(
@@ -588,6 +737,7 @@ fn select_funding_outpoint(
     blocks: &[Block],
     rpc: &Rpc,
     needed: u64,
+    purpose: FundingPurpose,
 ) -> Result<(String, u32)> {
     let snapshot = store
         .funding_snapshot()?
@@ -605,7 +755,8 @@ fn select_funding_outpoint(
         .map(String::as_str)
         .collect();
     for (txid, index, value) in snapshot.candidates(needed, &reserved) {
-        if value > needed && coinbases.contains(txid) {
+        let allow_coinbase = matches!(purpose, FundingPurpose::Shield) && value == needed;
+        if !allow_coinbase && coinbases.contains(txid) {
             continue;
         }
         let available: Value = rpc.call("gettxout", json!([txid, index, true]))?;
@@ -619,7 +770,7 @@ fn select_funding_outpoint(
             .as_u64()
             .context("missing confirmations")?;
         if confirmations < if coinbase { COINBASE_MATURITY } else { 1 }
-            || (coinbase && value != needed)
+            || (coinbase && !allow_coinbase)
         {
             continue;
         }

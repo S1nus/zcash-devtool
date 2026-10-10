@@ -158,6 +158,70 @@ pub fn build(payment: Payment<'_>) -> Result<Transaction> {
             .sign(&mut rng, &[0; 32], &key.derive_auth_private())?
             .stamp(stamp.clone()),
     );
+    let vout = transparent_output
+        .map(|(address, amount)| -> Result<_> {
+            Ok(TxOut::new(
+                Zatoshis::from_u64(amount)?,
+                transparent_script(&address)?,
+            ))
+        })
+        .transpose()?
+        .into_iter()
+        .collect();
+    authorize(seed, funding, vout, expiry, placeholder, |hash| {
+        Ok(TachyonBundle::Proven(
+            plan.sign(&mut rng, hash, &key.derive_auth_private())?
+                .stamp(stamp),
+        ))
+    })
+}
+
+/// Create a V7 payment with no Tachyon bundle or proofs, using the wallet's funding key.
+pub fn build_transparent(
+    seed: [u8; 32],
+    funding: Funding,
+    to: &str,
+    amount: u64,
+    expiry: u32,
+) -> Result<Transaction> {
+    ensure!(amount > 0, "amount must be positive");
+    let needed = amount
+        .checked_add(FEE)
+        .context("amount plus fee overflow")?;
+    let change = funding
+        .output
+        .value()
+        .into_u64()
+        .checked_sub(needed)
+        .context("funding output cannot cover amount plus fee")?;
+    let mut vout = vec![TxOut::new(
+        Zatoshis::from_u64(amount)?,
+        transparent_script(to)?,
+    )];
+    if change > 0 {
+        vout.push(TxOut::new(
+            Zatoshis::from_u64(change)?,
+            transparent_script(&funding_address(seed)?)?,
+        ));
+    }
+    authorize(
+        seed,
+        Some(funding),
+        vout,
+        expiry,
+        TachyonBundle::NoBundle,
+        |_| Ok(TachyonBundle::NoBundle),
+    )
+}
+
+fn authorize(
+    seed: [u8; 32],
+    funding: Option<Funding>,
+    vout: Vec<TxOut>,
+    expiry: u32,
+    placeholder: TachyonBundle,
+    authorize_tachyon: impl FnOnce(&[u8; 32]) -> Result<TachyonBundle>,
+) -> Result<Transaction> {
     let vin = funding
         .as_ref()
         .map(|f| {
@@ -168,16 +232,6 @@ pub fn build(payment: Payment<'_>) -> Result<Transaction> {
             )]
         })
         .unwrap_or_default();
-    let vout = transparent_output
-        .map(|(address, amount)| -> Result<_> {
-            Ok(TxOut::new(
-                Zatoshis::from_u64(amount)?,
-                transparent_script(&address)?,
-            ))
-        })
-        .transpose()?
-        .into_iter()
-        .collect::<Vec<_>>();
     let prevouts = funding
         .as_ref()
         .map(|f| vec![f.output.clone()])
@@ -200,10 +254,7 @@ pub fn build(payment: Payment<'_>) -> Result<Transaction> {
     );
     let digest = data.digest(TxIdDigester);
     let shielded_hash = signature_hash(&data, &SignableInput::Shielded, &digest);
-    let tachyon = TachyonBundle::Proven(
-        plan.sign(&mut rng, shielded_hash.as_ref(), &key.derive_auth_private())?
-            .stamp(stamp),
-    );
+    let tachyon = authorize_tachyon(shielded_hash.as_ref())?;
     let mut signed_vin = Vec::new();
     if let Some(funding) = funding {
         let script = funding.output.script_pubkey();
@@ -287,13 +338,16 @@ pub(crate) fn verify_for_test(tx: &Transaction, funding: Option<TxOut>) -> Resul
     );
     let digest = data.digest(TxIdDigester);
     let hash = signature_hash(&data, &SignableInput::Shielded, &digest);
-    let TachyonBundle::Proven(bundle) = tx.tachyon_bundle() else {
-        anyhow::bail!("missing proof")
-    };
-    let mut wtxid = [0; 64];
-    wtxid[..32].copy_from_slice(tx.txid().as_ref());
-    wtxid[32..].copy_from_slice(tx.auth_commitment().as_bytes());
-    bundle.verify(&mut rand::rng(), hash.as_ref(), &wtxid, &[])?;
+    match tx.tachyon_bundle() {
+        TachyonBundle::Proven(bundle) => {
+            let mut wtxid = [0; 64];
+            wtxid[..32].copy_from_slice(tx.txid().as_ref());
+            wtxid[32..].copy_from_slice(tx.auth_commitment().as_bytes());
+            bundle.verify(&mut rand::rng(), hash.as_ref(), &wtxid, &[])?;
+        }
+        TachyonBundle::NoBundle => ensure!(funding.is_some(), "transparent payment needs funding"),
+        _ => anyhow::bail!("unexpected bundle type"),
+    }
     if let Some(output) = funding {
         let b = data.transparent_bundle().unwrap();
         let input = transparent::sighash::SignableInput::from_parts(
