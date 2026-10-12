@@ -246,9 +246,16 @@ retains historical public inputs past node tachygram pruning. It does **not**
 independently validate consensus or the authenticity of a malicious RPC node.
 
 This implementation rebuilds proofs and loads its stored feed on demand. It is
-for small development chains, not a scalable proof service. A closed epoch is
-limited to 65,536 tachygrams; larger epochs fail explicitly and will require
-partitioned evidence. A later sidecar can cache evidence, schedule wallets,
+for small development chains, not a scalable proof service. Closed-epoch evidence
+routes individual stamps into bounded QR buckets before merging them, retaining
+every stamp's anchor transition even when its selected bucket is empty. Note
+membership and nullifier absence may use different buckets covering the same
+epoch. Each polynomial stays within Ragu's capacity (8,191 tachygrams with the
+pinned dependency), including when mock proofs are enabled. The wallet's separate
+resource budget is 65,536 tachygrams and stamps per epoch; larger epochs fail
+explicitly and need a more scalable evidence builder. Existing wallet databases
+and public inputs can be reused; this does not require a chain reset.
+A later sidecar can cache evidence, schedule wallets,
 exchange receipts, and observe mining; node-side aggregation remains Zakura's job.
 
 ## Validation

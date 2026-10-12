@@ -2,17 +2,19 @@
 //! Proofs are deliberately ephemeral; restarting never depends on serializing mock PCDs.
 
 use anyhow::{Context, Result, ensure};
-use pasta_curves::Fp;
 use ragu::{Pcd, Proof};
 use zcash_tachyon::{
-    Anchor, EpochIndex, Note, QrDiscriminant, Tachygram,
+    EpochIndex, Note, Tachygram,
     keys::private::SpendingKey,
     nullifier::NF_DERIVATION_WIDTH,
     stamp::proof::{PROOF_SYSTEM, delegation, pool, qr, spendable},
     witness,
 };
 
-use crate::chain::{Block, MAX_EPOCH_MEMBERS, anchor};
+use crate::chain::{Block, anchor};
+
+mod epoch;
+use epoch::bucket;
 
 fn trivial() -> Pcd<()> {
     Proof::trivial().carry(())
@@ -43,88 +45,6 @@ fn derivation(
             trivial(),
         )?
         .0)
-}
-
-fn bucket(blocks: &[Block], epoch: u32) -> Result<(Pcd<qr::QrBucket>, Vec<Tachygram>)> {
-    let epoch_blocks: Vec<_> = blocks.iter().filter(|b| b.epoch == epoch).collect();
-    let first = *epoch_blocks.first().context("missing epoch inputs")?;
-    let next = blocks
-        .iter()
-        .find(|b| b.epoch == epoch + 1)
-        .context("epoch has not closed")?;
-    let epoch_index = EpochIndex::new(epoch);
-    let discriminant = QrDiscriminant(Fp::from(1));
-    let mut members = Vec::new();
-    let mut intake: Option<Pcd<qr::QrIntake>> = None;
-    for block in epoch_blocks {
-        let mut cursor = block.entry()?;
-        for stamp in &block.stamps {
-            let grams = stamp.members()?;
-            ensure!(
-                members.len() + grams.len() <= MAX_EPOCH_MEMBERS,
-                "epoch exceeds experimental wallet capacity; a partitioned proof service is needed"
-            );
-            let (right, ()) = PROOF_SYSTEM.seed(
-                &mut rand::rng(),
-                qr::QrStampIntakeSeed,
-                witness::qr_stamp_intake_seed(((), ()), cursor, epoch_index, discriminant, &grams),
-            )?;
-            intake = Some(match intake {
-                None => right,
-                Some(left) => {
-                    PROOF_SYSTEM
-                        .fuse(
-                            &mut rand::rng(),
-                            qr::QrIntakeMerge,
-                            witness::qr_intake_merge(
-                                (*left.data(), *right.data()),
-                                &members,
-                                &grams,
-                            ),
-                            left,
-                            right,
-                        )?
-                        .0
-                }
-            });
-            members.extend(grams);
-            cursor = cursor.next_stamp(epoch_index, &stamp.commitment()?)?;
-        }
-    }
-    let intake = match intake {
-        Some(intake) => intake,
-        None => {
-            PROOF_SYSTEM
-                .seed(
-                    &mut rand::rng(),
-                    qr::QrEmptyIntakeSeed,
-                    witness::qr_empty_intake_seed(
-                        ((), ()),
-                        first.entry()?,
-                        epoch_index,
-                        discriminant,
-                    ),
-                )?
-                .0
-        }
-    };
-    let predecessor = if epoch == 0 {
-        Anchor(Fp::from(0))
-    } else {
-        anchor(&first.anchor_before)?
-    };
-    let (bucket, ()) = PROOF_SYSTEM.fuse(
-        &mut rand::rng(),
-        qr::QrBucketSeal,
-        witness::qr_bucket_seal((*intake.data(), ()), predecessor),
-        intake,
-        trivial(),
-    )?;
-    ensure!(
-        bucket.data().2 == next.entry()?,
-        "epoch evidence does not meet the next entry anchor"
-    );
-    Ok((bucket, members))
 }
 
 pub fn spendable(
@@ -171,13 +91,13 @@ pub fn spendable(
     let master = key.derive_nullifier_private().derive_note_private(note.psi);
     let mut lineage = None;
     for epoch in created..current {
-        let (bucket, members) = bucket(blocks, epoch)?;
         let nf = master.derive_nullifier(EpochIndex::new(epoch));
+        let (absence_bucket, members) = bucket(blocks, epoch, nf.into())?;
         let (arbitrary, ()) = PROOF_SYSTEM.fuse(
             &mut rand::rng(),
             qr::QrUnspentInit,
-            witness::qr_unspent_init((*bucket.data(), ()), nf.into(), &members),
-            bucket.clone(),
+            witness::qr_unspent_init((*absence_bucket.data(), ()), nf.into(), &members),
+            absence_bucket.clone(),
             trivial(),
         )?;
         let derived = derivation(&secret, epoch)?;
@@ -194,13 +114,23 @@ pub fn spendable(
         )?;
         lineage = Some(match lineage {
             None => {
+                // The note commitment need not route to its nullifier's bucket.
+                // Both proofs cover the same complete epoch and anchor bounds.
+                let (creation_bucket, members) = if members.contains(&cm) {
+                    (absence_bucket, members)
+                } else {
+                    bucket(blocks, epoch, cm)?
+                };
                 PROOF_SYSTEM
                     .fuse(
                         &mut rand::rng(),
                         spendable::QrSpendableInit,
-                        witness::qr_spendable_init((*unspent.data(), *bucket.data()), &members),
+                        witness::qr_spendable_init(
+                            (*unspent.data(), *creation_bucket.data()),
+                            &members,
+                        ),
                         unspent,
-                        bucket,
+                        creation_bucket,
                     )?
                     .0
             }

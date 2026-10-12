@@ -6,7 +6,8 @@ use protocol::{consensus::BranchId, value::Zatoshis};
 use sha2::{Digest, Sha256};
 use transparent::bundle::{OutPoint, TxOut};
 use zcash_tachyon::{
-    Anchor, EpochIndex, TachyonBundle, constants::EPOCH_SIZE, keys::private::SpendingKey,
+    Anchor, EpochIndex, QrClassRoot, Tachygram, TachygramSetPoly, TachyonBundle,
+    constants::EPOCH_SIZE, keys::private::SpendingKey,
 };
 
 use crate::{
@@ -222,6 +223,15 @@ fn chain_rejects_corrupt_inputs_and_discontinuities() -> Result<()> {
     let mut bad = blocks[1].clone();
     bad.epoch_length /= 2;
     assert!(bad.validate(Some(&blocks[0]), 8).is_err());
+    let mut bad = blocks[1].clone();
+    // Reject before constructing a polynomial, including under mock Ragu.
+    bad.stamps[0].tachygrams = vec![hex::encode([0; 32]); chain::max_polynomial_members() + 1];
+    assert!(
+        bad.validate(Some(&blocks[0]), 8)
+            .unwrap_err()
+            .to_string()
+            .contains("polynomial capacity")
+    );
     Ok(())
 }
 
@@ -313,6 +323,99 @@ fn old_note_spends_after_populated_and_empty_closed_epochs() -> Result<()> {
     Ok(())
 }
 
+/// Add distinct public stamp inputs without generating thousands of payments.
+/// Each stamp fits individually; their union deliberately exceeds one polynomial.
+fn populate_epoch(blocks: &mut Vec<Block>, count: usize) -> Result<()> {
+    mine(blocks, None)?;
+    let parent_index = blocks.len() - 2;
+    let mut block = blocks.last().unwrap().clone();
+    let epoch = EpochIndex::new(block.epoch);
+    let mut anchor = block.entry()?;
+    let existing: std::collections::BTreeSet<_> = blocks
+        .iter()
+        .filter(|b| b.epoch == block.epoch)
+        .flat_map(|b| &b.stamps)
+        .map(Stamp::members)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    let members: Vec<_> = (1u64..)
+        .map(|i| Tachygram::from(Fp::from(i)))
+        .filter(|member| !existing.contains(member))
+        .take(count)
+        .collect();
+    for (index, members) in members.chunks(64).enumerate() {
+        let commitment = members
+            .iter()
+            .copied()
+            .collect::<TachygramSetPoly>()
+            .commit();
+        anchor = anchor.next_stamp(epoch, &commitment)?;
+        let mut bytes = Vec::new();
+        commitment.write(&mut bytes)?;
+        block.stamps.push(Stamp {
+            transaction_index: index,
+            txid: hex::encode(Sha256::digest(index.to_le_bytes())),
+            tachygram_set: hex::encode(bytes),
+            tachygrams: members
+                .iter()
+                .map(|m| hex::encode(Fp::from(*m).to_repr()))
+                .collect(),
+        });
+    }
+    block.anchor_after = chain::anchor_hex(anchor);
+    block.validate(Some(&blocks[parent_index]), 8)?;
+    *blocks.last_mut().unwrap() = block;
+    Ok(())
+}
+
+#[test]
+fn spends_after_epoch_with_more_tachygrams_than_polynomial_capacity() -> Result<()> {
+    let mut blocks = vec![genesis()];
+    let key = SpendingKey::from(SEED);
+    let older = own(1_000_000);
+    let funded = shield(&blocks, &older)?;
+    mine(&mut blocks, Some(&funded))?;
+    while blocks.last().unwrap().epoch < 1 {
+        mine(&mut blocks, None)?;
+    }
+    // Force creation membership and nullifier absence into different QR buckets.
+    let receipt = (0..64)
+        .map(|_| own(1_000_000))
+        .find(|r| {
+            let note = r.note().unwrap();
+            let nf = key
+                .derive_nullifier_private()
+                .derive_note_private(note.psi)
+                .derive_nullifier(EpochIndex::new(1));
+            QrClassRoot::of(note.commitment().into(), Fp::from(1)).0
+                != QrClassRoot::of(nf.into(), Fp::from(1)).0
+        })
+        .expect("one of 64 random notes routes differently from its nullifier");
+    let funded = shield(&blocks, &receipt)?;
+    mine(&mut blocks, Some(&funded))?;
+    populate_epoch(&mut blocks, chain::max_polynomial_members() + 19)?;
+    while blocks.last().unwrap().epoch < 2 {
+        mine(&mut blocks, None)?;
+    }
+    assert_eq!(blocks.last().unwrap().height, 8200);
+    // Exercise both routed creation and lifting an older note through a large epoch.
+    for receipt in [&receipt, &older] {
+        let sent = transaction::build(Payment {
+            seed: SEED,
+            blocks: &blocks,
+            spend: Some(receipt),
+            funding: None,
+            outputs: &[own(950_000)],
+            transparent_output: None,
+            expiry: blocks.last().unwrap().height + 20,
+        })?;
+        transaction::verify_for_test(&sent, None)?;
+    }
+    Ok(())
+}
+
 #[test]
 fn spent_note_cannot_produce_closed_epoch_absence_evidence() -> Result<()> {
     let mut blocks = vec![genesis()];
@@ -333,5 +436,35 @@ fn spent_note_cannot_produce_closed_epoch_absence_evidence() -> Result<()> {
         mine(&mut blocks, None)?;
     }
     assert!(crate::proofs::spendable(&blocks, &SpendingKey::from(SEED), receipt.note()?).is_err());
+    Ok(())
+}
+
+#[test]
+fn spent_note_cannot_hide_in_another_routed_bucket() -> Result<()> {
+    let mut blocks = vec![genesis()];
+    let receipt = own(1_000_000);
+    let funded = shield(&blocks, &receipt)?;
+    mine(&mut blocks, Some(&funded))?;
+    let sent = transaction::build(Payment {
+        seed: SEED,
+        blocks: &blocks,
+        spend: Some(&receipt),
+        funding: None,
+        outputs: &[own(950_000)],
+        transparent_output: None,
+        expiry: 30,
+    })?;
+    mine(&mut blocks, Some(&sent))?;
+    populate_epoch(&mut blocks, chain::max_polynomial_members() + 19)?;
+    while blocks.last().unwrap().epoch < 1 {
+        mine(&mut blocks, None)?;
+    }
+    let error = crate::proofs::spendable(&blocks, &SpendingKey::from(SEED), receipt.note()?)
+        .err()
+        .expect("a spent note must fail absence verification");
+    assert!(
+        error.to_string().contains("found nullifier in the bucket"),
+        "{error}"
+    );
     Ok(())
 }

@@ -23,6 +23,7 @@ sha2 = "0.10"
 ripemd = "0.1"
 zcash_script = "0.4.3"
 ragu = { git = "https://github.com/tachyon-zcash/ragu", rev = "0881656dc3d9f47d3d9eaaf692b15dd8938d9bf9", features = ["mock"] }
+ragu_circuits = { git = "https://github.com/tachyon-zcash/ragu", rev = "0881656dc3d9f47d3d9eaaf692b15dd8938d9bf9" }
 zcash_tachyon = { git = "https://github.com/tachyon-zcash/tachyon", rev = "a4abfbddb7dd4ac1db67df7cc19d57d0d965d3e7" }
 primitives = { package = "zakura-primitives", git = "https://github.com/zakura-core/common.git", rev = "a9081dc0c3df782bd2badb829f9ebff51d01a9a7", default-features = false, features = ["std"] }
 protocol = { package = "zakura-protocol", git = "https://github.com/zakura-core/common.git", rev = "a9081dc0c3df782bd2badb829f9ebff51d01a9a7" }

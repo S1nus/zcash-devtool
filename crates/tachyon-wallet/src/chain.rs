@@ -1,12 +1,18 @@
 //! Validated, replayable public chain inputs. No wallet secrets enter this module.
 
 use anyhow::{Context, Result, ensure};
+use ragu_circuits::polynomials::{ProductionRank, Rank};
 use serde::{Deserialize, Serialize};
 use zcash_tachyon::{
     Anchor, EpochIndex, Tachygram, TachygramSetCommit, TachygramSetPoly, constants,
 };
 
 pub const MAX_EPOCH_MEMBERS: usize = 65_536;
+
+/// A set of N roots needs N + 1 coefficients, even with mock proofs.
+pub fn max_polynomial_members() -> usize {
+    ProductionRank::num_coeffs() - 1
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,8 +62,8 @@ pub fn anchor_hex(value: Anchor) -> String {
 impl Stamp {
     pub fn members(&self) -> Result<Vec<Tachygram>> {
         ensure!(
-            self.tachygrams.len() <= MAX_EPOCH_MEMBERS,
-            "stamp exceeds wallet's experimental capacity"
+            self.tachygrams.len() <= max_polynomial_members(),
+            "stamp exceeds Tachyon's polynomial capacity"
         );
         self.tachygrams
             .iter()

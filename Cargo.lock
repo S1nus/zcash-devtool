@@ -7317,6 +7317,7 @@ dependencies = [
  "ff 0.14.0",
  "hex",
  "ragu",
+ "ragu_circuits",
  "rand 0.10.2",
  "reqwest",
  "ripemd 0.1.3",
