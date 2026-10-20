@@ -244,6 +244,7 @@ fn command(dir: &std::path::Path, command: Operation) -> Result<Value> {
 }
 fn command_with_id(dir: &std::path::Path, command: Operation, id: Option<&str>) -> Result<Value> {
     Command {
+        proof_progress: None,
         wallet_dir: dir.into(),
         operation_id: id.map(str::to_owned),
         command,
@@ -694,6 +695,36 @@ fn install_funding(node: &Node, address: &str, amounts: &[u64]) -> Result<Transa
         )?);
     }
     Ok(funding)
+}
+
+#[test]
+fn proof_progress_is_opt_in_and_global() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        wallet: Command,
+    }
+    let parse = |args: &[&str]| {
+        Cli::try_parse_from(
+            ["test", "--wallet-dir", "unused"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+    };
+    assert!(parse(&["balance"]).unwrap().wallet.proof_progress.is_none());
+    for mode in ["off", "auto", "plain", "tty"] {
+        for args in [
+            vec!["--proof-progress", mode, "balance"],
+            vec!["balance", "--proof-progress", mode],
+        ] {
+            assert_eq!(
+                parse(&args).unwrap().wallet.proof_progress,
+                Some(<crate::progress::Mode as clap::ValueEnum>::from_str(mode, false).unwrap())
+            );
+        }
+    }
+    assert!(parse(&["balance", "--proof-progress", "invalid"]).is_err());
 }
 
 #[test]

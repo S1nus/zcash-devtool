@@ -31,6 +31,9 @@ pub struct Command {
     /// Optional wallet-local idempotency key for shield/send/unshield/transparent-send.
     #[arg(long, global = true)]
     operation_id: Option<String>,
+    /// Optional proof execution trace on stderr: off, plain, tty, or auto.
+    #[arg(long, global = true, value_enum)]
+    proof_progress: Option<crate::progress::Mode>,
     #[command(subcommand)]
     command: Operation,
 }
@@ -117,6 +120,7 @@ enum Operation {
 
 impl Command {
     pub fn run(self) -> Result<()> {
+        crate::progress::configure(self.proof_progress.unwrap_or_default());
         let result = self.execute()?;
         println!("{}", serde_json::to_string(&result)?);
         Ok(())
