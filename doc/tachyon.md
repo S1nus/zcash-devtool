@@ -1,5 +1,7 @@
 # Experimental Tachyon wallets
 
+For optional proof-step diagnostics, see [proof execution tracing](tachyon-proof-progress.md).
+
 The optional `tachyon` command group supports direct Zakura RPC synchronization,
 shielding a transparent UTXO, sending Tachyon payments with change, unshielding,
 and transparent-to-transparent transfers. Each wallet has its own persistent state and machine-readable JSON

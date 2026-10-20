@@ -11,40 +11,58 @@ use zcash_tachyon::{
     witness,
 };
 
-use crate::chain::{Block, anchor};
+use crate::{
+    chain::{Block, anchor},
+    progress::{Step, StepId},
+};
 
 mod epoch;
-use epoch::bucket;
+use epoch::{Bucket, bucket};
 
 fn trivial() -> Pcd<()> {
     Proof::trivial().carry(())
 }
 
 pub fn secret(key: &SpendingKey, note: Note) -> Result<Pcd<delegation::NoteSecret>> {
-    Ok(PROOF_SYSTEM
-        .seed(
-            &mut rand::rng(),
-            delegation::NoteSeed,
-            witness::note_seed(((), ()), note, key.derive_proof_private()),
-        )?
-        .0)
+    Ok(secret_with_id(key, note)?.0)
+}
+
+fn secret_with_id(key: &SpendingKey, note: Note) -> Result<(Pcd<delegation::NoteSecret>, StepId)> {
+    let step = Step::start("NoteSeed", &[]);
+    let id = step.id();
+    let proof = step
+        .run(|| {
+            PROOF_SYSTEM.seed(
+                &mut rand::rng(),
+                delegation::NoteSeed,
+                witness::note_seed(((), ()), note, key.derive_proof_private()),
+            )
+        })?
+        .0;
+    Ok((proof, id))
 }
 
 fn derivation(
     secret: &Pcd<delegation::NoteSecret>,
+    secret_id: StepId,
     epoch: u32,
-) -> Result<Pcd<delegation::NoteNullifiers>> {
+) -> Result<(Pcd<delegation::NoteNullifiers>, StepId)> {
     let width = u32::try_from(NF_DERIVATION_WIDTH)?;
     let start = EpochIndex::new(epoch - epoch % width);
-    Ok(PROOF_SYSTEM
-        .fuse(
-            &mut rand::rng(),
-            delegation::NullifierDerive,
-            witness::nullifier_derive((*secret.data(), ()), start),
-            secret.clone(),
-            trivial(),
-        )?
-        .0)
+    let step = Step::start("NullifierDerive", &[secret_id]);
+    let id = step.id();
+    let proof = step
+        .run(|| {
+            PROOF_SYSTEM.fuse(
+                &mut rand::rng(),
+                delegation::NullifierDerive,
+                witness::nullifier_derive((*secret.data(), ()), start),
+                secret.clone(),
+                trivial(),
+            )
+        })?
+        .0;
+    Ok((proof, id))
 }
 
 pub fn spendable(
@@ -70,84 +88,119 @@ pub fn spendable(
         }
     }
     let (created, before, members) = creation.context("note commitment has not been mined")?;
-    let secret = secret(key, note)?;
+    let (secret, secret_id) = secret_with_id(key, note)?;
     if created == current {
-        let derived = derivation(&secret, current)?;
-        return Ok(PROOF_SYSTEM
-            .fuse(
-                &mut rand::rng(),
-                spendable::SpendableInit,
-                witness::spendable_init(
-                    (*derived.data(), ()),
-                    before,
-                    &members,
-                    EpochIndex::new(current),
-                ),
-                derived,
-                trivial(),
-            )?
+        let (derived, derived_id) = derivation(&secret, secret_id, current)?;
+        let step = Step::start("SpendableInit", &[derived_id]);
+        return Ok(step
+            .run(|| {
+                PROOF_SYSTEM.fuse(
+                    &mut rand::rng(),
+                    spendable::SpendableInit,
+                    witness::spendable_init(
+                        (*derived.data(), ()),
+                        before,
+                        &members,
+                        EpochIndex::new(current),
+                    ),
+                    derived,
+                    trivial(),
+                )
+            })?
             .0);
     }
     let master = key.derive_nullifier_private().derive_note_private(note.psi);
     let mut lineage = None;
     for epoch in created..current {
         let nf = master.derive_nullifier(EpochIndex::new(epoch));
-        let (absence_bucket, members) = bucket(blocks, epoch, nf.into())?;
-        let (arbitrary, ()) = PROOF_SYSTEM.fuse(
-            &mut rand::rng(),
-            qr::QrUnspentInit,
-            witness::qr_unspent_init((*absence_bucket.data(), ()), nf.into(), &members),
-            absence_bucket.clone(),
-            trivial(),
-        )?;
-        let derived = derivation(&secret, epoch)?;
+        let Bucket {
+            proof: absence_bucket,
+            members,
+            step_id: absence_id,
+        } = bucket(blocks, epoch, nf.into())?;
+        let step = Step::start("QrUnspentInit", &[absence_id]);
+        let arbitrary_id = step.id();
+        let (arbitrary, ()) = step.run(|| {
+            PROOF_SYSTEM.fuse(
+                &mut rand::rng(),
+                qr::QrUnspentInit,
+                witness::qr_unspent_init((*absence_bucket.data(), ()), nf.into(), &members),
+                absence_bucket.clone(),
+                trivial(),
+            )
+        })?;
+        let (derived, derived_id) = derivation(&secret, secret_id, epoch)?;
         let (_, first, _, last) = *derived.data();
         let window: Vec<_> = (u32::from(first)..=u32::from(last))
             .map(|e| master.derive_nullifier(EpochIndex::new(e)))
             .collect();
-        let (unspent, ()) = PROOF_SYSTEM.fuse(
-            &mut rand::rng(),
-            pool::UnspentBind,
-            witness::unspent_bind((*arbitrary.data(), *derived.data()), &window, &[nf]),
-            arbitrary,
-            derived,
-        )?;
+        let step = Step::start("UnspentBind", &[arbitrary_id, derived_id]);
+        let unspent_id = step.id();
+        let (unspent, ()) = step.run(|| {
+            PROOF_SYSTEM.fuse(
+                &mut rand::rng(),
+                pool::UnspentBind,
+                witness::unspent_bind((*arbitrary.data(), *derived.data()), &window, &[nf]),
+                arbitrary,
+                derived,
+            )
+        })?;
         lineage = Some(match lineage {
             None => {
                 // The note commitment need not route to its nullifier's bucket.
                 // Both proofs cover the same complete epoch and anchor bounds.
-                let (creation_bucket, members) = if members.contains(&cm) {
-                    (absence_bucket, members)
+                let Bucket {
+                    proof: creation_bucket,
+                    members,
+                    step_id: creation_id,
+                } = if members.contains(&cm) {
+                    Bucket {
+                        proof: absence_bucket,
+                        members,
+                        step_id: absence_id,
+                    }
                 } else {
                     bucket(blocks, epoch, cm)?
                 };
-                PROOF_SYSTEM
-                    .fuse(
-                        &mut rand::rng(),
-                        spendable::QrSpendableInit,
-                        witness::qr_spendable_init(
-                            (*unspent.data(), *creation_bucket.data()),
-                            &members,
-                        ),
-                        unspent,
-                        creation_bucket,
-                    )?
-                    .0
+                let step = Step::start("QrSpendableInit", &[unspent_id, creation_id]);
+                let step_id = step.id();
+                let proof = step
+                    .run(|| {
+                        PROOF_SYSTEM.fuse(
+                            &mut rand::rng(),
+                            spendable::QrSpendableInit,
+                            witness::qr_spendable_init(
+                                (*unspent.data(), *creation_bucket.data()),
+                                &members,
+                            ),
+                            unspent,
+                            creation_bucket,
+                        )
+                    })?
+                    .0;
+                (proof, step_id)
             }
-            Some(left) => {
-                PROOF_SYSTEM
-                    .fuse(
-                        &mut rand::rng(),
-                        spendable::SpendableLift,
-                        (),
-                        left,
-                        unspent,
-                    )?
-                    .0
+            Some((left, left_id)) => {
+                let step = Step::start("SpendableLift", &[left_id, unspent_id]);
+                let step_id = step.id();
+                let proof = step
+                    .run(|| {
+                        PROOF_SYSTEM.fuse(
+                            &mut rand::rng(),
+                            spendable::SpendableLift,
+                            (),
+                            left,
+                            unspent,
+                        )
+                    })?
+                    .0;
+                (proof, step_id)
             }
         });
     }
-    lineage.context("closed creation epoch must produce a spendable proof")
+    lineage
+        .map(|(proof, _)| proof)
+        .context("closed creation epoch must produce a spendable proof")
 }
 
 pub fn lift_stamp(
@@ -175,5 +228,6 @@ pub fn lift_stamp(
         }
     }
     ensure!(cursor == target, "cannot lift the stamp to the synced tip");
-    Ok(stamp.lift(&mut rand::rng(), descriptors, links)?)
+    let step = Step::start("ProofStamp::lift", &[]);
+    Ok(step.run(|| stamp.lift(&mut rand::rng(), descriptors, links))?)
 }

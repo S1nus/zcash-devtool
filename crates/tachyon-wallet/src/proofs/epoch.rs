@@ -13,8 +13,10 @@ use zcash_tachyon::{
 
 use super::trivial;
 use crate::chain::{Block, MAX_EPOCH_MEMBERS, anchor, max_polynomial_members};
+use crate::progress::{Step, StepId};
 
 struct Intake {
+    step_id: StepId,
     proof: Pcd<qr::QrIntake>,
     members: Vec<Tachygram>,
 }
@@ -43,23 +45,31 @@ fn routing_path(
 impl Intake {
     fn route(mut self, path: &[bool], discriminant: QrDiscriminant) -> Result<Self> {
         for (depth, &side) in path.iter().enumerate() {
-            let (sides, ()) = PROOF_SYSTEM.fuse(
-                &mut rand::rng(),
-                qr::QrIntakeSplit,
-                witness::qr_intake_split((*self.proof.data(), ()), &self.members),
-                self.proof,
-                trivial(),
-            )?;
-            self.proof = PROOF_SYSTEM
-                .fuse(
+            let step = Step::start("QrIntakeSplit", &[self.step_id]);
+            let sides_id = step.id();
+            let (sides, ()) = step.run(|| {
+                PROOF_SYSTEM.fuse(
                     &mut rand::rng(),
-                    qr::QrSideDescend,
-                    // The witness needs the entire pre-split set, including the
-                    // sibling whose exclusion from this path it certifies.
-                    witness::qr_side_descend((*sides.data(), ()), &self.members, side),
-                    sides,
+                    qr::QrIntakeSplit,
+                    witness::qr_intake_split((*self.proof.data(), ()), &self.members),
+                    self.proof,
                     trivial(),
-                )?
+                )
+            })?;
+            let step = Step::start("QrSideDescend", &[sides_id]);
+            self.step_id = step.id();
+            self.proof = step
+                .run(|| {
+                    PROOF_SYSTEM.fuse(
+                        &mut rand::rng(),
+                        qr::QrSideDescend,
+                        // The witness needs the entire pre-split set, including the
+                        // sibling whose exclusion from this path it certifies.
+                        witness::qr_side_descend((*sides.data(), ()), &self.members, side),
+                        sides,
+                        trivial(),
+                    )
+                })?
                 .0;
             let shift = discriminant.at(u32::try_from(depth)?);
             self.members
@@ -73,29 +83,35 @@ impl Intake {
             self.members.len() + right.members.len() <= max_polynomial_members(),
             "routed epoch bucket exceeds Tachyon's polynomial capacity"
         );
-        self.proof = PROOF_SYSTEM
-            .fuse(
-                &mut rand::rng(),
-                qr::QrIntakeMerge,
-                witness::qr_intake_merge(
-                    (*self.proof.data(), *right.proof.data()),
-                    &self.members,
-                    &right.members,
-                ),
-                self.proof,
-                right.proof,
-            )?
+        let step = Step::start("QrIntakeMerge", &[self.step_id, right.step_id]);
+        self.step_id = step.id();
+        self.proof = step
+            .run(|| {
+                PROOF_SYSTEM.fuse(
+                    &mut rand::rng(),
+                    qr::QrIntakeMerge,
+                    witness::qr_intake_merge(
+                        (*self.proof.data(), *right.proof.data()),
+                        &self.members,
+                        &right.members,
+                    ),
+                    self.proof,
+                    right.proof,
+                )
+            })?
             .0;
         self.members.extend(right.members);
         Ok(self)
     }
 }
 
-pub(super) fn bucket(
-    blocks: &[Block],
-    epoch: u32,
-    query: Tachygram,
-) -> Result<(Pcd<qr::QrBucket>, Vec<Tachygram>)> {
+pub(super) struct Bucket {
+    pub proof: Pcd<qr::QrBucket>,
+    pub members: Vec<Tachygram>,
+    pub step_id: StepId,
+}
+
+pub(super) fn bucket(blocks: &[Block], epoch: u32, query: Tachygram) -> Result<Bucket> {
     let mut epoch_blocks = blocks.iter().filter(|b| b.epoch == epoch).peekable();
     let first = *epoch_blocks.peek().context("missing epoch inputs")?;
     let next_epoch = epoch.checked_add(1).context("epoch overflow")?;
@@ -129,22 +145,45 @@ pub(super) fn bucket(
     let path = routing_path(all_members.into_iter().collect(), query, discriminant)?;
     let mut intakes = Vec::new();
     for (before, members) in stamps {
-        let (proof, ()) = PROOF_SYSTEM.seed(
-            &mut rand::rng(),
-            qr::QrStampIntakeSeed,
-            witness::qr_stamp_intake_seed(((), ()), before, epoch_index, discriminant, &members),
-        )?;
+        let step = Step::start("QrStampIntakeSeed", &[]);
+        let step_id = step.id();
+        let (proof, ()) = step.run(|| {
+            PROOF_SYSTEM.seed(
+                &mut rand::rng(),
+                qr::QrStampIntakeSeed,
+                witness::qr_stamp_intake_seed(
+                    ((), ()),
+                    before,
+                    epoch_index,
+                    discriminant,
+                    &members,
+                ),
+            )
+        })?;
         // Keep even empty routed intakes: each still covers its original stamp's
         // anchor transition. Dropping one would leave a gap in epoch evidence.
-        intakes.push(Intake { proof, members }.route(&path, discriminant)?);
+        intakes.push(
+            Intake {
+                proof,
+                members,
+                step_id,
+            }
+            .route(&path, discriminant)?,
+        );
     }
     if intakes.is_empty() {
-        let (proof, ()) = PROOF_SYSTEM.seed(
-            &mut rand::rng(),
-            qr::QrEmptyIntakeSeed,
-            witness::qr_empty_intake_seed(((), ()), first.entry()?, epoch_index, discriminant),
-        )?;
+        let entry = first.entry()?;
+        let step = Step::start("QrEmptyIntakeSeed", &[]);
+        let step_id = step.id();
+        let (proof, ()) = step.run(|| {
+            PROOF_SYSTEM.seed(
+                &mut rand::rng(),
+                qr::QrEmptyIntakeSeed,
+                witness::qr_empty_intake_seed(((), ()), entry, epoch_index, discriminant),
+            )
+        })?;
         intakes.push(Intake {
+            step_id,
             proof,
             members: Vec::new(),
         });
@@ -162,24 +201,36 @@ pub(super) fn bucket(
         }
         intakes = merged;
     }
-    let Intake { proof, members } = intakes.pop().context("missing epoch intake")?;
+    let Intake {
+        proof,
+        members,
+        step_id,
+    } = intakes.pop().context("missing epoch intake")?;
     let predecessor = if epoch == 0 {
         Anchor(Fp::from(0))
     } else {
         anchor(&first.anchor_before)?
     };
-    let (bucket, ()) = PROOF_SYSTEM.fuse(
-        &mut rand::rng(),
-        qr::QrBucketSeal,
-        witness::qr_bucket_seal((*proof.data(), ()), predecessor),
-        proof,
-        trivial(),
-    )?;
+    let step = Step::start("QrBucketSeal", &[step_id]);
+    let bucket_id = step.id();
+    let (bucket, ()) = step.run(|| {
+        PROOF_SYSTEM.fuse(
+            &mut rand::rng(),
+            qr::QrBucketSeal,
+            witness::qr_bucket_seal((*proof.data(), ()), predecessor),
+            proof,
+            trivial(),
+        )
+    })?;
     ensure!(
         bucket.data().2 == next.entry()?,
         "epoch evidence does not meet the next entry anchor"
     );
-    Ok((bucket, members))
+    Ok(Bucket {
+        proof: bucket,
+        members,
+        step_id: bucket_id,
+    })
 }
 
 #[cfg(test)]
@@ -202,11 +253,15 @@ mod tests {
         let mut anchor = Anchor::default();
         let mut intakes = Vec::new();
         for members in [vec![excluded[0]], vec![excluded[1]], vec![query]] {
-            let (proof, ()) = PROOF_SYSTEM.seed(
-                &mut rand::rng(),
-                qr::QrStampIntakeSeed,
-                witness::qr_stamp_intake_seed(((), ()), anchor, epoch, discriminant, &members),
-            )?;
+            let step = Step::start("QrStampIntakeSeed", &[]);
+            let step_id = step.id();
+            let (proof, ()) = step.run(|| {
+                PROOF_SYSTEM.seed(
+                    &mut rand::rng(),
+                    qr::QrStampIntakeSeed,
+                    witness::qr_stamp_intake_seed(((), ()), anchor, epoch, discriminant, &members),
+                )
+            })?;
             anchor = anchor.next_stamp(
                 epoch,
                 &members
@@ -215,7 +270,14 @@ mod tests {
                     .collect::<TachygramSetPoly>()
                     .commit(),
             )?;
-            intakes.push(Intake { proof, members }.route(&[side], discriminant)?);
+            intakes.push(
+                Intake {
+                    proof,
+                    members,
+                    step_id,
+                }
+                .route(&[side], discriminant)?,
+            );
         }
         assert!(intakes[0].members.is_empty());
         assert!(intakes[1].members.is_empty());
