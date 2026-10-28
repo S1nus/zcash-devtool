@@ -1,4 +1,5 @@
 use super::*;
+use crate::control::Control;
 
 fn snapshot(height: u32, output_height: u32, coinbase: bool) -> Result<Snapshot> {
     let address = transaction::funding_address(crate::tests::SEED)?;
@@ -22,7 +23,7 @@ fn snapshot(height: u32, output_height: u32, coinbase: bool) -> Result<Snapshot>
             "satoshis": 625_000_000, "height": output_height}]
     }))?;
     response.into_snapshot(
-        &Rpc::new("http://127.0.0.1:1", None)?,
+        &Rpc::new("http://127.0.0.1:1", None, &Control::new(true))?,
         &address,
         &[origin, tip],
     )
@@ -88,7 +89,7 @@ fn rejects_duplicate_foreign_future_and_malformed_outputs() -> Result<()> {
         assert!(
             response
                 .into_snapshot(
-                    &Rpc::new("http://127.0.0.1:1", None)?,
+                    &Rpc::new("http://127.0.0.1:1", None, &Control::new(true))?,
                     &address,
                     std::slice::from_ref(&tip)
                 )

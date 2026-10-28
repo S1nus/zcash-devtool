@@ -87,6 +87,7 @@ impl AddressUtxos {
         let mut seen = BTreeSet::new();
         let mut utxos = Vec::with_capacity(self.utxos.len());
         for output in self.utxos {
+            rpc.control.check()?;
             let txid = hex::encode(bytes32(&output.txid)?);
             ensure!(
                 seen.insert((txid.clone(), output.index)),

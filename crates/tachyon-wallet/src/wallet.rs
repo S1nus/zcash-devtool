@@ -2,6 +2,7 @@
 
 use crate::{
     chain::{Block, bytes32},
+    control::{self, Control},
     funding_balance::{AddressUtxos, COINBASE_MATURITY},
     note::{self, Receipt},
     rpc::Rpc,
@@ -31,6 +32,9 @@ pub struct Command {
     /// Optional wallet-local idempotency key for shield/send/unshield/transparent-send.
     #[arg(long, global = true)]
     operation_id: Option<String>,
+    /// Suppress progress on stderr (errors and interruption notices remain visible).
+    #[arg(long, short = 'q', global = true)]
+    quiet: bool,
     #[command(subcommand)]
     command: Operation,
 }
@@ -116,13 +120,31 @@ enum Operation {
 }
 
 impl Command {
+    /// Run with OS signal handling and periodic progress for long proof/RPC steps.
+    pub async fn run_interruptible(self) -> Result<()> {
+        control::run(self.quiet, move |control| self.run_with_control(&control)).await
+    }
+
+    /// Synchronous entry point without OS signal handling.
     pub fn run(self) -> Result<()> {
-        let result = self.execute()?;
+        let control = Control::new(self.quiet);
+        self.run_with_control(&control)
+    }
+
+    fn run_with_control(self, control: &Control) -> Result<()> {
+        let result = self.execute_with_control(control)?;
         println!("{}", serde_json::to_string(&result)?);
         Ok(())
     }
 
+    #[cfg(test)]
     fn execute(self) -> Result<Value> {
+        let control = Control::new(self.quiet);
+        self.execute_with_control(&control)
+    }
+
+    fn execute_with_control(self, control: &Control) -> Result<Value> {
+        control.check()?;
         if let Some(id) = &self.operation_id {
             validate_operation_id(id)?;
             ensure!(
@@ -151,7 +173,7 @@ impl Command {
                 activation_height > 0,
                 "NuTachyon must activate after genesis"
             );
-            let rpc = Rpc::new(&rpc_url, cookie_file.clone())?;
+            let rpc = Rpc::new(&rpc_url, cookie_file.clone(), control)?;
             let info: Value = rpc.call("getblockchaininfo", json!([]))?;
             ensure!(
                 matches!(info["chain"].as_str(), Some("test" | "regtest")),
@@ -177,12 +199,16 @@ impl Command {
                 network_id: hex::encode(identity),
                 seed: note::random_seed(),
             };
+            // Finish this short initialization transaction once started, rather
+            // than leaving a newly-created wallet without its configuration.
+            control.stage("Initializing wallet database…")?;
             let store = Store::open(&self.wallet_dir, true)?;
             store.set_config(&config)?;
             store.put_block(&block)?;
             store.commit()?;
             return addresses(&config);
         }
+        control.stage("Opening wallet database…")?;
         let store = Store::open(&self.wallet_dir, false)?;
         let config = store.config()?;
         let key = SpendingKey::from(config.seed);
@@ -191,7 +217,7 @@ impl Command {
             Operation::Address => addresses(&config)?,
             Operation::Balance => {
                 let blocks = store.blocks()?;
-                let states = note_states(&store, &config, &blocks)?;
+                let states = note_states(&store, &config, &blocks, control)?;
                 let available = states
                     .iter()
                     .filter(|(_, s)| *s == "available")
@@ -220,7 +246,7 @@ impl Command {
                     "transparent":transparent,
                     "notes":states.into_iter().map(|(r,s)| Ok(json!({"id":r.id()?,"value_zat":r.value_zat,"status":s}))).collect::<Result<Vec<_>>>()?})
             }
-            Operation::Sync { max_blocks } => sync(&store, &config, max_blocks)?,
+            Operation::Sync { max_blocks } => sync(&store, &config, max_blocks, control)?,
             Operation::Receive { receipt } => {
                 let mut data = Vec::new();
                 std::fs::File::open(receipt)?
@@ -254,7 +280,7 @@ impl Command {
             }
             Operation::Submit { txid } => {
                 ensure!(
-                    sync(&store, &config, 1000)?["caught_up"] == true,
+                    sync(&store, &config, 1000, control)?["caught_up"] == true,
                     "run sync until caught up before submitting"
                 );
                 let pending = find_pending(&store, &txid)?;
@@ -264,9 +290,10 @@ impl Command {
                     status != "expired",
                     "transaction expired; create a new payment"
                 );
+                control.check()?;
                 store.commit()?;
                 if status != "mined" {
-                    rpc(&config)?.submit(&txid, &pending.raw)?;
+                    rpc(&config, control)?.submit(&txid, &pending.raw)?;
                 }
                 return Ok(
                     json!({"txid":txid,"status":if status == "mined" {"mined"} else {"submitted"}}),
@@ -276,16 +303,23 @@ impl Command {
             | Operation::Send { .. }
             | Operation::Unshield { .. }
             | Operation::TransparentSend { .. }) => {
-                return pay(&store, &config, operation, self.operation_id.as_deref());
+                return pay(
+                    &store,
+                    &config,
+                    operation,
+                    self.operation_id.as_deref(),
+                    control,
+                );
             }
         };
+        control.stage("Committing wallet updates…")?;
         store.commit()?;
         Ok(result)
     }
 }
 
-fn rpc(config: &Config) -> Result<Rpc> {
-    Rpc::new(&config.rpc_url, config.cookie_file.clone())
+fn rpc(config: &Config, control: &Control) -> Result<Rpc> {
+    Rpc::new(&config.rpc_url, config.cookie_file.clone(), control)
 }
 fn addresses(config: &Config) -> Result<Value> {
     Ok(
@@ -294,8 +328,8 @@ fn addresses(config: &Config) -> Result<Value> {
     )
 }
 
-fn sync(store: &Store, config: &Config, max_blocks: u32) -> Result<Value> {
-    let rpc = rpc(config)?;
+fn sync(store: &Store, config: &Config, max_blocks: u32, control: &Control) -> Result<Value> {
+    let rpc = rpc(config, control)?;
     ensure!(
         rpc.hash(0)? == config.genesis && rpc.hash(config.activation)? == config.activation_hash,
         "network identity changed (including possible regenesis); use a separate wallet directory"
@@ -305,8 +339,10 @@ fn sync(store: &Store, config: &Config, max_blocks: u32) -> Result<Value> {
     // mining continues while we download. Partial syncs retain their older snapshot.
     let funding = AddressUtxos::fetch(&rpc, &funding_address)?;
     let tip = funding.height;
+    control.stage("Loading saved chain inputs…")?;
     let mut blocks = store.blocks()?;
     while let Some(last) = blocks.last() {
+        control.check()?;
         if last.height <= tip && rpc.hash(last.height)? == last.hash {
             break;
         }
@@ -317,14 +353,27 @@ fn sync(store: &Store, config: &Config, max_blocks: u32) -> Result<Value> {
         .context("activation block changed; reinitialize on the intended network")?;
     store.rewind(last.height)?;
     let stop = last.height.saturating_add(max_blocks).min(tip);
+    let start = last.height;
+    control.stage(format!(
+        "Syncing {} blocks: height {start} → {stop} (node tip {tip})…",
+        stop - start
+    ))?;
     for height in last.height.saturating_add(1)..=stop {
+        control.stage(format!(
+            "Fetching block {height} ({}/{})…",
+            height - start,
+            stop - start
+        ))?;
         let block = rpc.block(height)?;
+        control.stage(format!("Validating block {height}…"))?;
         block.validate(blocks.last(), config.activation)?;
+        control.check()?;
         store.put_block(&block)?;
         blocks.push(block);
     }
     let last = blocks.last().context("activation block exists")?;
     if last.height == tip {
+        control.stage("Validating transparent funding snapshot…")?;
         let snapshot = funding.into_snapshot(&rpc, &funding_address, &blocks)?;
         store.put_funding_snapshot(&snapshot)?;
     }
@@ -363,7 +412,9 @@ fn note_states(
     store: &Store,
     config: &Config,
     blocks: &[Block],
+    control: &Control,
 ) -> Result<Vec<(Receipt, &'static str)>> {
+    control.stage("Checking note states…")?;
     let key = SpendingKey::from(config.seed);
     let reserved: BTreeSet<_> = store
         .pending()?
@@ -373,6 +424,7 @@ fn note_states(
         .collect();
     let mut epoch_members: BTreeMap<u32, BTreeSet<&str>> = BTreeMap::new();
     for block in blocks {
+        control.check()?;
         let members = epoch_members.entry(block.epoch).or_default();
         members.extend(
             block
@@ -385,6 +437,7 @@ fn note_states(
         .notes()?
         .into_iter()
         .map(|receipt| {
+            control.check()?;
             receipt.check_owner(&key, &config.network_id)?;
             let id = receipt.id()?;
             let note = receipt.note()?;
@@ -486,6 +539,7 @@ fn pay(
     config: &Config,
     operation: Operation,
     operation_id: Option<&str>,
+    control: &Control,
 ) -> Result<Value> {
     let request = payment_request(&operation)?;
     if let Some(id) = operation_id
@@ -497,11 +551,12 @@ fn pay(
         );
         let mut result = operation_result(store, &saved)?;
         result["reused"] = json!(true);
+        control.check()?;
         store.commit()?;
         return Ok(result); // Offline: never reselect inputs, rebuild proofs, or rebroadcast.
     }
     ensure!(
-        sync(store, config, 1000)?["caught_up"] == true,
+        sync(store, config, 1000, control)?["caught_up"] == true,
         "run sync until caught up before creating transactions"
     );
     let blocks = store.blocks()?;
@@ -533,7 +588,7 @@ fn pay(
     let mut transparent_output = None;
     let mut recipient = None;
     let source;
-    let rpc = rpc(config)?;
+    let rpc = rpc(config, control)?;
     match operation {
         Operation::Shield {
             amount_zat,
@@ -607,7 +662,7 @@ fn pay(
         Operation::Send { to, amount_zat } | Operation::Unshield { to, amount_zat } => {
             ensure!(amount_zat > 0, "amount must be positive");
             let needed = amount_zat.checked_add(FEE).context("amount overflow")?;
-            let selected = note_states(store, config, &blocks)?.into_iter().filter(|(r,s)| *s == "available" && r.value_zat >= needed)
+            let selected = note_states(store, config, &blocks, control)?.into_iter().filter(|(r,s)| *s == "available" && r.value_zat >= needed)
                 .min_by_key(|(r,_)| r.value_zat).map(|(r,_)| r).context("no single available note covers amount plus fee; this wallet does not consolidate notes")?;
             source = format!("note:{}", selected.id()?);
             // The command-specific address format was checked before accessing the node.
@@ -627,6 +682,7 @@ fn pay(
         }
         _ => anyhow::bail!("not a payment operation"),
     }
+    control.stage("Building payment…")?;
     let tx = if transparent_only {
         let (to, amount) = transparent_output.context("transparent payment has a recipient")?;
         transaction::build_transparent(
@@ -637,15 +693,18 @@ fn pay(
             expiry,
         )?
     } else {
-        transaction::build(Payment {
-            seed: config.seed,
-            blocks: &blocks,
-            spend: spend.as_ref(),
-            funding,
-            outputs: &outputs,
-            transparent_output,
-            expiry,
-        })?
+        transaction::build(
+            Payment {
+                seed: config.seed,
+                blocks: &blocks,
+                spend: spend.as_ref(),
+                funding,
+                outputs: &outputs,
+                transparent_output,
+                expiry,
+            },
+            control,
+        )?
     };
     ensure!(
         rpc.hash(tip.height)? == tip.hash && rpc.height()? <= expiry,
@@ -675,6 +734,7 @@ fn pay(
         })?;
     }
     // A timeout is not a rejection: commit both change receipts and the reservation BEFORE broadcast.
+    control.stage("Persisting signed transaction and input reservation before broadcast…")?;
     store.commit()?;
     rpc.submit(&txid, &pending.raw).with_context(|| {
         format!("transaction {txid} saved; use transactions/submit/export-receipt to recover")

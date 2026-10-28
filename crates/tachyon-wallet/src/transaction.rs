@@ -23,6 +23,7 @@ use zcash_tachyon::{
 
 use crate::{
     chain::{Block, anchor},
+    control::Control,
     note::Receipt,
     proofs,
 };
@@ -92,7 +93,8 @@ pub struct Payment<'a> {
     pub expiry: u32,
 }
 
-pub fn build(payment: Payment<'_>) -> Result<Transaction> {
+pub fn build(payment: Payment<'_>, control: &Control) -> Result<Transaction> {
+    control.check()?;
     let Payment {
         seed,
         blocks,
@@ -126,7 +128,7 @@ pub fn build(payment: Payment<'_>) -> Result<Transaction> {
     let mut spends = Vec::new();
     if let Some(receipt) = spend {
         let note = receipt.note()?;
-        let spendable = proofs::spendable(blocks, &key, note)?;
+        let spendable = proofs::spendable(blocks, &key, note, control)?;
         plan_anchor = spendable.data().2;
         spends.push(action::Plan::spend(
             note,
@@ -134,7 +136,7 @@ pub fn build(payment: Payment<'_>) -> Result<Transaction> {
             value::Trapdoor::random(&mut rng),
             |alpha| key.derive_proof_private().ak.derive_action_public(&alpha),
         ));
-        evidence.push((proofs::secret(&key, note)?, spendable));
+        evidence.push((proofs::secret(&key, note, control)?, spendable));
     }
     let outputs = outputs
         .iter()
@@ -147,12 +149,14 @@ pub fn build(payment: Payment<'_>) -> Result<Transaction> {
         })
         .collect::<Result<Vec<_>>>()?;
     let plan = Plan::new(spends, outputs);
+    control.stage("Proving transaction stamp…")?;
     let stamp = plan.clone().stamp_plan(plan_anchor).prove(
         &mut rng,
         &key.derive_proof_private(),
         evidence,
     )?;
-    let stamp = proofs::lift_stamp(blocks, stamp, &plan.descriptors())?;
+    let stamp = proofs::lift_stamp(blocks, stamp, &plan.descriptors(), control)?;
+    control.stage("Signing transaction…")?;
     let placeholder = TachyonBundle::Proven(
         plan.clone()
             .sign(&mut rng, &[0; 32], &key.derive_auth_private())?

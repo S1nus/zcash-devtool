@@ -26,6 +26,7 @@ struct NodeData {
     fail_funding_sync: bool,
     funding_hash_override: Option<String>,
     earlier_blocks: BTreeMap<u32, Value>,
+    cancel_request: Option<(String, Option<Value>, Control)>,
 }
 struct Node {
     url: String,
@@ -56,6 +57,7 @@ impl Node {
             fail_funding_sync: false,
             funding_hash_override: None,
             earlier_blocks: BTreeMap::new(),
+            cancel_request: None,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_data = data.clone();
@@ -173,14 +175,28 @@ impl Node {
                     }
                     other => panic!("unexpected RPC {other}"),
                 };
+                if let Some((method, params, control)) = &data.cancel_request
+                    && request["method"] == *method
+                    && params
+                        .as_ref()
+                        .is_none_or(|params| request["params"] == *params)
+                {
+                    control.cancellation.cancel();
+                }
                 drop(data);
                 let response = serde_json::to_vec(
                     &json!({"jsonrpc":"2.0","id":1,"result":result,"error":error}),
                 )
                 .unwrap();
                 let mut stream = reader.into_inner();
-                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",response.len()).unwrap();
-                stream.write_all(&response).unwrap();
+                // Cancellation can drop the HTTP connection before the reply.
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                    response.len()
+                );
+                let _ = stream
+                    .write_all(reply.as_bytes())
+                    .and_then(|_| stream.write_all(&response));
             }
         });
         Ok(Self {
@@ -246,6 +262,7 @@ fn command_with_id(dir: &std::path::Path, command: Operation, id: Option<&str>) 
     Command {
         wallet_dir: dir.into(),
         operation_id: id.map(str::to_owned),
+        quiet: true,
         command,
     }
     .execute()
@@ -1064,6 +1081,78 @@ fn partial_sync_keeps_canonical_snapshots_and_reorgs_replace_them() -> Result<()
 }
 
 #[test]
+fn cancelled_sync_rolls_back_blocks_and_funding_snapshot_and_can_resume() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    init_wallet(&node, &dir)?;
+    let before = synced_balance(&dir)?;
+    let control = Control::new(true);
+    {
+        let mut data = node.data.lock().unwrap();
+        crate::tests::mine(&mut data.blocks, None)?;
+        // Interrupt the final consistency check, after the new block and
+        // funding snapshot have been written inside the open transaction.
+        data.cancel_request = Some(("getblockhash".into(), Some(json!([9])), control.clone()));
+    }
+    let error = Command {
+        wallet_dir: dir.clone(),
+        operation_id: None,
+        quiet: true,
+        command: Operation::Sync { max_blocks: 1000 },
+    }
+    .execute_with_control(&control)
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("cancelled"));
+    assert_eq!(command(&dir, Operation::Balance)?, before);
+    node.data.lock().unwrap().cancel_request = None;
+    assert_eq!(synced_balance(&dir)?["synced_height"], 9);
+    Ok(())
+}
+
+#[test]
+fn cancelled_broadcast_retains_signed_payment_and_reservation() -> Result<()> {
+    let node = Node::start()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("wallet");
+    let address = init_wallet(&node, &dir)?;
+    install_funding(&node, &address, &[250_000])?;
+    let control = Control::new(true);
+    node.data.lock().unwrap().cancel_request =
+        Some(("sendrawtransaction".into(), None, control.clone()));
+    let error = Command {
+        wallet_dir: dir.clone(),
+        operation_id: Some("cancelled-payment".into()),
+        quiet: true,
+        command: transparent_send(&address, 100_000),
+    }
+    .execute_with_control(&control)
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("input remains reserved"));
+    assert!(format!("{error:#}").contains("cancelled"));
+    node.data.lock().unwrap().cancel_request = None;
+    let saved = command(
+        &dir,
+        Operation::Lookup {
+            id: "cancelled-payment".into(),
+        },
+    )?;
+    assert_eq!(saved["status"], "pending");
+    let balance = synced_balance(&dir)?;
+    assert_eq!(balance["transparent"]["reserved_zat"], 250_000);
+    assert_eq!(balance["transparent"]["available_zat"], 0);
+    let replay = command_with_id(
+        &dir,
+        transparent_send(&address, 100_000),
+        Some("cancelled-payment"),
+    )?;
+    assert_eq!(replay["txid"], saved["txid"]);
+    assert_eq!(replay["reused"], true);
+    assert_eq!(node.data.lock().unwrap().submissions, 1);
+    Ok(())
+}
+
+#[test]
 fn funding_rpc_failures_and_tip_mismatches_roll_back_sync() -> Result<()> {
     let node = Node::start()?;
     let temp = tempfile::tempdir()?;
@@ -1407,10 +1496,19 @@ fn reservations_survive_restarts_and_expire_only_after_expiry_height() -> Result
         network_id: crate::tests::NETWORK.into(),
         seed: crate::tests::SEED,
     };
-    assert_eq!(note_states(&store, &config, &blocks)?[0].1, "reserved");
+    assert_eq!(
+        note_states(&store, &config, &blocks, &Control::new(true))?[0].1,
+        "reserved"
+    );
     crate::tests::mine(&mut blocks, None)?;
-    assert_eq!(note_states(&store, &config, &blocks)?[0].1, "reserved");
+    assert_eq!(
+        note_states(&store, &config, &blocks, &Control::new(true))?[0].1,
+        "reserved"
+    );
     crate::tests::mine(&mut blocks, None)?;
-    assert_eq!(note_states(&store, &config, &blocks)?[0].1, "available");
+    assert_eq!(
+        note_states(&store, &config, &blocks, &Control::new(true))?[0].1,
+        "available"
+    );
     Ok(())
 }

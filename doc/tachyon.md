@@ -169,6 +169,41 @@ format here. Import checks ownership and network identity, and does not credit
 funds until the note commitment appears in the validated feed. Own outputs and
 change are recorded automatically. Export never overwrites an existing file.
 
+## Progress and interruption
+
+Tachyon commands print progress to **stderr** by default: RPC method names,
+block heights, validation, proof stages, and persistence before broadcast.
+Long-running stages print an elapsed-time heartbeat approximately every 10 seconds.
+RPC parameters, cookies, keys, receipts, and raw transactions are not progress output.
+The single JSON result on **stdout** is unchanged for scripts and the workload sidecar.
+Use `--quiet` (or `-q`) before or after the subcommand to suppress progress, but
+not errors or interruption notices:
+
+```sh
+$DEVTOOL tachyon --wallet-dir ./alice sync --max-blocks 10000
+$DEVTOOL tachyon --wallet-dir ./alice sync --max-blocks 10000 --quiet
+```
+
+**Ctrl+C** requests cancellation, including while an RPC is awaiting headers or
+its response body. On macOS, use Control+C; Command+C normally copies text.
+Unix `SIGTERM` (for example, from systemd) also requests cancellation. Proof
+work checks between steps; an individual cryptographic call may need to finish.
+A second interrupt forces process exit if necessary. Interrupted commands exit
+with status 130 for SIGINT or 143 for SIGTERM.
+
+An interrupted sync rolls back its **entire uncommitted batch**, not just the
+last block, and resumes from the last successful invocation. Use a smaller
+`--max-blocks` if you want more frequent saved progress. Signed payments, receipts,
+and input reservations already committed before broadcast remain saved: an
+interrupted broadcast can still have reached the node. Keep wallet data, sync,
+and inspect `transactions` or `operation`; use `submit` to retry the same bytes,
+not a new payment ID. RPC connections time out after 10 seconds, and each whole
+request (including its body) has a 30-second deadline even without an interrupt.
+
+`sync` validates public chain inputs; spendability proofs are reconstructed later
+when creating a payment. If an SSH connection is lost, local keystrokes may not
+reach the server; signal the specific remote process from another connection.
+
 ## Recovery and proof updates
 
 ### Durable operation IDs for a sidecar

@@ -13,6 +13,7 @@ use zcash_tachyon::{
 
 use super::trivial;
 use crate::chain::{Block, MAX_EPOCH_MEMBERS, anchor, max_polynomial_members};
+use crate::control::Control;
 
 struct Intake {
     proof: Pcd<qr::QrIntake>,
@@ -25,9 +26,11 @@ fn routing_path(
     mut members: Vec<Tachygram>,
     query: Tachygram,
     discriminant: QrDiscriminant,
+    control: &Control,
 ) -> Result<Vec<bool>> {
     let mut path = Vec::new();
     while members.len() > max_polynomial_members() {
+        control.check()?;
         ensure!(
             path.len() < QrProfile::MAX_DEPTH,
             "epoch cannot be routed within Tachyon's polynomial capacity"
@@ -41,8 +44,14 @@ fn routing_path(
 }
 
 impl Intake {
-    fn route(mut self, path: &[bool], discriminant: QrDiscriminant) -> Result<Self> {
+    fn route(
+        mut self,
+        path: &[bool],
+        discriminant: QrDiscriminant,
+        control: &Control,
+    ) -> Result<Self> {
         for (depth, &side) in path.iter().enumerate() {
+            control.check()?;
             let (sides, ()) = PROOF_SYSTEM.fuse(
                 &mut rand::rng(),
                 qr::QrIntakeSplit,
@@ -50,6 +59,7 @@ impl Intake {
                 self.proof,
                 trivial(),
             )?;
+            control.check()?;
             self.proof = PROOF_SYSTEM
                 .fuse(
                     &mut rand::rng(),
@@ -68,7 +78,8 @@ impl Intake {
         Ok(self)
     }
 
-    fn merge(mut self, right: Self) -> Result<Self> {
+    fn merge(mut self, right: Self, control: &Control) -> Result<Self> {
+        control.check()?;
         ensure!(
             self.members.len() + right.members.len() <= max_polynomial_members(),
             "routed epoch bucket exceeds Tachyon's polynomial capacity"
@@ -95,7 +106,9 @@ pub(super) fn bucket(
     blocks: &[Block],
     epoch: u32,
     query: Tachygram,
+    control: &Control,
 ) -> Result<(Pcd<qr::QrBucket>, Vec<Tachygram>)> {
+    control.stage(format!("Collecting public evidence for epoch {epoch}…"))?;
     let mut epoch_blocks = blocks.iter().filter(|b| b.epoch == epoch).peekable();
     let first = *epoch_blocks.peek().context("missing epoch inputs")?;
     let next_epoch = epoch.checked_add(1).context("epoch overflow")?;
@@ -108,8 +121,10 @@ pub(super) fn bucket(
     let mut stamps = Vec::new();
     let mut all_members = BTreeSet::new();
     for block in epoch_blocks {
+        control.check()?;
         let mut cursor = block.entry()?;
         for stamp in &block.stamps {
+            control.check()?;
             let members = stamp.members()?;
             ensure!(
                 all_members.len() + members.len() <= MAX_EPOCH_MEMBERS
@@ -126,9 +141,19 @@ pub(super) fn bucket(
             cursor = cursor.next_stamp(epoch_index, &stamp.commitment()?)?;
         }
     }
-    let path = routing_path(all_members.into_iter().collect(), query, discriminant)?;
+    let path = routing_path(
+        all_members.into_iter().collect(),
+        query,
+        discriminant,
+        control,
+    )?;
     let mut intakes = Vec::new();
-    for (before, members) in stamps {
+    let total = stamps.len();
+    for (index, (before, members)) in stamps.into_iter().enumerate() {
+        control.stage(format!(
+            "Proving epoch {epoch} stamp intake {}/{total}…",
+            index + 1
+        ))?;
         let (proof, ()) = PROOF_SYSTEM.seed(
             &mut rand::rng(),
             qr::QrStampIntakeSeed,
@@ -136,9 +161,10 @@ pub(super) fn bucket(
         )?;
         // Keep even empty routed intakes: each still covers its original stamp's
         // anchor transition. Dropping one would leave a gap in epoch evidence.
-        intakes.push(Intake { proof, members }.route(&path, discriminant)?);
+        intakes.push(Intake { proof, members }.route(&path, discriminant, control)?);
     }
     if intakes.is_empty() {
+        control.stage(format!("Proving empty epoch {epoch}…"))?;
         let (proof, ()) = PROOF_SYSTEM.seed(
             &mut rand::rng(),
             qr::QrEmptyIntakeSeed,
@@ -152,11 +178,12 @@ pub(super) fn bucket(
     // Balanced, adjacent merges avoid rebuilding an ever-growing prefix for
     // every stamp, while preserving the original anchor order.
     while intakes.len() > 1 {
+        control.stage(format!("Merging {} epoch {epoch} intakes…", intakes.len()))?;
         let mut merged = Vec::new();
         let mut pairs = intakes.into_iter();
         while let Some(left) = pairs.next() {
             merged.push(match pairs.next() {
-                Some(right) => left.merge(right)?,
+                Some(right) => left.merge(right, control)?,
                 None => left,
             });
         }
@@ -168,6 +195,7 @@ pub(super) fn bucket(
     } else {
         anchor(&first.anchor_before)?
     };
+    control.stage(format!("Sealing epoch {epoch} bucket…"))?;
     let (bucket, ()) = PROOF_SYSTEM.fuse(
         &mut rand::rng(),
         qr::QrBucketSeal,
@@ -215,7 +243,11 @@ mod tests {
                     .collect::<TachygramSetPoly>()
                     .commit(),
             )?;
-            intakes.push(Intake { proof, members }.route(&[side], discriminant)?);
+            intakes.push(Intake { proof, members }.route(
+                &[side],
+                discriminant,
+                &Control::new(true),
+            )?);
         }
         assert!(intakes[0].members.is_empty());
         assert!(intakes[1].members.is_empty());
@@ -224,8 +256,8 @@ mod tests {
         let intake = intakes
             .next()
             .unwrap()
-            .merge(intakes.next().unwrap())?
-            .merge(intakes.next().unwrap())?;
+            .merge(intakes.next().unwrap(), &Control::new(true))?
+            .merge(intakes.next().unwrap(), &Control::new(true))?;
         assert_eq!(intake.proof.data().1, Anchor::default());
         assert_eq!(intake.proof.data().2, anchor);
         let (bucket, ()) = PROOF_SYSTEM.fuse(
@@ -263,11 +295,12 @@ mod tests {
             routing_path(
                 members[..max_polynomial_members()].to_vec(),
                 query,
-                discriminant
+                discriminant,
+                &Control::new(true)
             )?
             .is_empty()
         );
-        let path = routing_path(members, query, discriminant)?;
+        let path = routing_path(members, query, discriminant, &Control::new(true))?;
         assert_eq!(path.len(), 2);
         assert_eq!(path[0], side);
         assert_eq!(path[1], QrClassRoot::of(query.into(), discriminant.at(1)).0);

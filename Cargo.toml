@@ -139,3 +139,6 @@ zakura-reddsa = { git = "https://github.com/zakura-core/common.git", rev = "a908
 members = ["crates/tachyon-wallet"]
 default-members = ["."]
 resolver = "2"
+
+[dev-dependencies]
+tempfile = "3"

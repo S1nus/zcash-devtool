@@ -12,12 +12,17 @@ use zcash_tachyon::{
 
 use crate::{
     chain::{self, Block, Stamp},
+    control::Control,
     note::{self, Receipt},
     transaction::{self, FEE, Funding, Payment},
 };
 
 pub(crate) const SEED: [u8; 32] = [7; 32];
 pub(crate) const NETWORK: &str = "test-network";
+
+fn build(payment: Payment<'_>) -> Result<Transaction> {
+    transaction::build(payment, &Control::new(true))
+}
 
 pub(crate) fn genesis() -> Block {
     let anchor = chain::anchor_hex(Anchor::default());
@@ -93,7 +98,7 @@ pub(crate) fn own(value: u64) -> Receipt {
 }
 
 pub(crate) fn shield(blocks: &[Block], receipt: &Receipt) -> Result<Transaction> {
-    transaction::build(Payment {
+    build(Payment {
         seed: SEED,
         blocks,
         spend: None,
@@ -257,7 +262,7 @@ fn shield_transfer_change_and_unshield_roundtrip_with_valid_authorization() -> R
         300_000,
     )?;
     let change = own(650_000);
-    let sent = transaction::build(Payment {
+    let sent = build(Payment {
         seed: SEED,
         blocks: &blocks,
         spend: Some(&funded),
@@ -276,7 +281,7 @@ fn shield_transfer_change_and_unshield_roundtrip_with_valid_authorization() -> R
         chain::anchor(&blocks.last().unwrap().anchor_after)?
     );
     mine(&mut blocks, Some(&sent))?;
-    let unshield = transaction::build(Payment {
+    let unshield = build(Payment {
         seed: SEED,
         blocks: &blocks,
         spend: Some(&change),
@@ -310,7 +315,7 @@ fn old_note_spends_after_populated_and_empty_closed_epochs() -> Result<()> {
     while blocks.last().unwrap().epoch < 2 {
         mine(&mut blocks, None)?;
     }
-    let sent = transaction::build(Payment {
+    let sent = build(Payment {
         seed: SEED,
         blocks: &blocks,
         spend: Some(&receipt),
@@ -402,7 +407,7 @@ fn spends_after_epoch_with_more_tachygrams_than_polynomial_capacity() -> Result<
     assert_eq!(blocks.last().unwrap().height, 8200);
     // Exercise both routed creation and lifting an older note through a large epoch.
     for receipt in [&receipt, &older] {
-        let sent = transaction::build(Payment {
+        let sent = build(Payment {
             seed: SEED,
             blocks: &blocks,
             spend: Some(receipt),
@@ -422,7 +427,7 @@ fn spent_note_cannot_produce_closed_epoch_absence_evidence() -> Result<()> {
     let receipt = own(1_000_000);
     let funded = shield(&blocks, &receipt)?;
     mine(&mut blocks, Some(&funded))?;
-    let sent = transaction::build(Payment {
+    let sent = build(Payment {
         seed: SEED,
         blocks: &blocks,
         spend: Some(&receipt),
@@ -435,7 +440,15 @@ fn spent_note_cannot_produce_closed_epoch_absence_evidence() -> Result<()> {
     while blocks.last().unwrap().epoch < 1 {
         mine(&mut blocks, None)?;
     }
-    assert!(crate::proofs::spendable(&blocks, &SpendingKey::from(SEED), receipt.note()?).is_err());
+    assert!(
+        crate::proofs::spendable(
+            &blocks,
+            &SpendingKey::from(SEED),
+            receipt.note()?,
+            &Control::new(true)
+        )
+        .is_err()
+    );
     Ok(())
 }
 
@@ -445,7 +458,7 @@ fn spent_note_cannot_hide_in_another_routed_bucket() -> Result<()> {
     let receipt = own(1_000_000);
     let funded = shield(&blocks, &receipt)?;
     mine(&mut blocks, Some(&funded))?;
-    let sent = transaction::build(Payment {
+    let sent = build(Payment {
         seed: SEED,
         blocks: &blocks,
         spend: Some(&receipt),
@@ -459,9 +472,14 @@ fn spent_note_cannot_hide_in_another_routed_bucket() -> Result<()> {
     while blocks.last().unwrap().epoch < 1 {
         mine(&mut blocks, None)?;
     }
-    let error = crate::proofs::spendable(&blocks, &SpendingKey::from(SEED), receipt.note()?)
-        .err()
-        .expect("a spent note must fail absence verification");
+    let error = crate::proofs::spendable(
+        &blocks,
+        &SpendingKey::from(SEED),
+        receipt.note()?,
+        &Control::new(true),
+    )
+    .err()
+    .expect("a spent note must fail absence verification");
     assert!(
         error.to_string().contains("found nullifier in the bucket"),
         "{error}"
