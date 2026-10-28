@@ -4,31 +4,49 @@ The Tachyon fork of [zcash-devtool](https://github.com/zcash/zcash-devtool). See
 
 Here you will find utilities for interacting with the Tachyon shielded protocol.
 
-Run `zcash-devtool tachyon --help` to view available commands.
-
 ## Build
 
 `RUSTFLAGS='--cfg zcash_unstable="nutachyon"' cargo build --release --locked --features tachyon`
 
 the binary will be available in `./target/release/zcash-devtool`
 
+Instructions for the Tachyon Alpha Testnet.
 
-## Security Warnings
+## Init
 
-**DO NOT USE THIS IN PRODUCTION!!!**
+```sh
+DEVTOOL="$PWD/target/release/zcash-devtool"
+WALLET="$HOME/tachyon-wallet"
 
-This app has not been written with security in mind. It does however have affordances
-such as encryption of the mnemonic seed phrases that should make it viable for small
-scale experimentation, at your own risk.
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" init \
+  --rpc-url http://tachyscan.cnode.phd:18232 \
+  --activation-height 8 --accept-mock-proofs
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" address
+```
 
-## Documentation
+## Receive (Tachyon)
 
-For experimental mock-proof Tachyon wallets connected directly to a private
-Zakura network, see [the Tachyon guide](doc/tachyon.md). This is an optional,
-separate wallet implementation, not an extension of the production wallet DB.
+Get funds from the [faucet](https://tachyscan.cnode.phd/faucet) using your `tachyon_address`, and save the downloaded note JSON as `~/Downloads/faucet-note.json`.
 
-For a step-by-step guide for how to get started using these tools, see [this
-walkthrough](doc/walkthrough.md).
+```sh
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" receive \
+  --receipt "$HOME/Downloads/faucet-note.json"
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" sync --max-blocks 10000
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" balance
+```
+
+Repeat `sync` until `caught_up` is `true`; the payment must be mined before it becomes available.
+
+## Send (Tachyon)
+
+```sh
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" send \
+  --to 'tachyon-test:RECIPIENT_PAYMENT_KEY' --amount-zat 1000000
+"$DEVTOOL" tachyon --wallet-dir "$WALLET" export-receipt \
+  --txid PAYMENT_TXID --out "$HOME/payment.json"
+```
+
+Replace `PAYMENT_TXID` with the ID returned by `send`. Share `payment.json` privately with the recipient so they can import it with `receive`.
 
 ## License
 
